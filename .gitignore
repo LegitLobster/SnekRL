@@ -1,0 +1,24 @@
+# Python / virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+
+# Build / dist outputs
+build/
+dist/
+build_out/
+dist_out/
+
+# Logs / outputs
+rl_out/
+*.log
+*.csv
+*.gif
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
