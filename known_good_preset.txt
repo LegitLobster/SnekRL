@@ -1,0 +1,26 @@
+Known-Good Preset (learning-speed)
+Date: 2026-01-27
+
+Command:
+C:\vscode\snek\.venv\Scripts\python.exe C:\vscode\snek\train_rl.py --live-plot --until-solved --clean-logs --n-envs 64 --batch-size 16384 --gradient-steps 16 --buffer-size 500000 --learning-starts 100000 --train-every 1 --n-step 3 --eps-reset 0.6 --eps-end 0.05 --eps-decay-steps 200000 --eps-exp-k 6 --eval-interval 25000 --success-episodes 2 --target-update 5000 --plot-refresh-ms 16 --plot-stream-interval-sec 0.033 --device cuda
+
+Key settings:
+- n_envs: 64
+- batch_size: 16384
+- gradient_steps: 16
+- buffer_size: 500000
+- learning_starts: 100000
+- train_every: 1
+- n_step: 3
+- lr: 5e-4 (default)
+- eps_start: 1.0 (default)
+- eps_end: 0.05
+- eps_reset: 0.6
+- eps_decay_steps: 200000
+- eps_exp_k: 6
+- eval_interval: 25000
+- success_episodes: 2
+
+Notes:
+- Aggressive epsilon decay and faster evals to speed board progression.
+- Use the ?Known-Good? launch configs in .vscode/launch.json for clean/resume.
