@@ -390,9 +390,14 @@ def evaluate(
         ep_reward = 0.0
         steps = 0
         while not done:
-            if stop_file is not None and stop_file.exists():
-                timed_out = True
-                break
+            if stop_file is not None:
+                try:
+                    if stop_file.exists():
+                        timed_out = True
+                        break
+                except OSError:
+                    # Skip stop check if OS is under resource pressure.
+                    pass
             obs_t = torch.as_tensor(pad_obs(obs, target_h, target_w), device=device, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 action = torch.argmax(qnet(obs_t), dim=1).item()
@@ -453,21 +458,21 @@ def main():
         help="Ignore timesteps and run until max_grid is solved.",
     )
     parser.add_argument("--n-envs", type=int, default=64)
-    parser.add_argument("--buffer-size", type=int, default=200_000)
-    parser.add_argument("--batch-size", type=int, default=16384)
+    parser.add_argument("--buffer-size", type=int, default=1_000_000)
+    parser.add_argument("--batch-size", type=int, default=32768)
     parser.add_argument("--learning-starts", type=int, default=50_000)
     parser.add_argument("--train-every", type=int, default=1)
-    parser.add_argument("--gradient-steps", type=int, default=16)
-    parser.add_argument("--target-update", type=int, default=10_000)
+    parser.add_argument("--gradient-steps", type=int, default=32)
+    parser.add_argument("--target-update", type=int, default=5_000)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--eps-start", type=float, default=1.0)
     parser.add_argument("--eps-reset", type=float, default=0.6)
-    parser.add_argument("--eps-end", type=float, default=0.05)
+    parser.add_argument("--eps-end", type=float, default=0.15)
     parser.add_argument("--eps-decay-steps", type=int, default=200_000)
     parser.add_argument("--eps-decay-type", type=str, default="exp", choices=["linear", "exp"])
-    parser.add_argument("--eps-exp-k", type=float, default=6.0)
-    parser.add_argument("--n-step", type=int, default=3)
+    parser.add_argument("--eps-exp-k", type=float, default=10.0)
+    parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--fast-food", action="store_true", help="Use fast GPU food respawn")
     parser.add_argument(
         "--full-gpu-env",
@@ -479,9 +484,9 @@ def main():
     parser.add_argument("--per-beta-steps", type=int, default=1_000_000)
     parser.add_argument("--per-priority-eps", type=float, default=1e-6)
     parser.add_argument("--target-tau", type=float, default=0.005)
-    parser.add_argument("--random-start-prob", type=float, default=0.2)
-    parser.add_argument("--random-start-min-frac", type=float, default=0.3)
-    parser.add_argument("--random-start-max-frac", type=float, default=0.7)
+    parser.add_argument("--random-start-prob", type=float, default=0.4)
+    parser.add_argument("--random-start-min-frac", type=float, default=0.4)
+    parser.add_argument("--random-start-max-frac", type=float, default=0.9)
     parser.add_argument("--random-start-max-tries", type=int, default=200)
     parser.add_argument("--random-start-size-decay", type=float, default=0.5)
     parser.add_argument(
@@ -508,7 +513,7 @@ def main():
         default=True,
         help="Keep replay buffer when the board size increases.",
     )
-    parser.add_argument("--eval-interval", type=int, default=25_000)
+    parser.add_argument("--eval-interval", type=int, default=5_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--max-eval-steps", type=int, default=2000)
     parser.add_argument("--max-eval-seconds", type=float, default=30.0)
@@ -529,14 +534,15 @@ def main():
     parser.add_argument("--checkpoint-on-log", action="store_true", default=False)
     parser.add_argument("--gif-interval", type=int, default=0)
     parser.add_argument("--live-plot", action="store_true")
-    parser.add_argument("--plot-refresh-ms", type=int, default=16)
+    parser.add_argument("--plot-refresh-ms", type=int, default=1000)
     parser.add_argument("--plot-stream-port", type=int, default=8765)
     parser.add_argument("--plot-stream-interval-sec", type=float, default=0.016)
+    parser.add_argument("--plot-no-stream", action="store_true")
     parser.add_argument("--stop-file", type=str, default="")
     parser.add_argument("--clean-logs", action="store_true", default=True)
     parser.add_argument("--resume", action="store_true", default=False)
     parser.add_argument("--curriculum", action="store_true", default=True)
-    parser.add_argument("--min-grid", type=int, default=4)
+    parser.add_argument("--min-grid", type=int, default=8)
     parser.add_argument("--max-grid", type=int, default=12)
     args = parser.parse_args()
 
@@ -821,35 +827,39 @@ def _main(args, out_dir: Path, error_log: Path):
         plot_script = Path(__file__).with_name("plot_live.py")
         if plot_script.exists():
             log_status("startup: launching plot")
+            plot_args = [
+                sys.executable,
+                str(plot_script),
+                "--log",
+                str(log_path),
+                "--eval",
+                str(eval_log_path),
+                "--stop-file",
+                str(stop_file),
+                "--refresh-ms",
+                str(args.plot_refresh_ms),
+                "--stream-port",
+                str(args.plot_stream_port),
+                "--display-window",
+                "0",
+                "--display-max-points",
+                "0",
+            ]
+            if args.plot_no_stream:
+                plot_args.append("--no-stream")
             plot_proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(plot_script),
-                    "--log",
-                    str(log_path),
-                    "--eval",
-                    str(eval_log_path),
-                    "--stop-file",
-                    str(stop_file),
-                    "--refresh-ms",
-                    str(args.plot_refresh_ms),
-                    "--stream-port",
-                    str(args.plot_stream_port),
-                    "--display-window",
-                    "0",
-                    "--display-max-points",
-                    "0",
-                ],
+                plot_args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            try:
-                plot_sock = socket.create_connection(("127.0.0.1", args.plot_stream_port), timeout=0.5)
-                plot_sock.setblocking(False)
-                plot_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-                plot_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-            except OSError:
-                plot_sock = None
+            if not args.plot_no_stream:
+                try:
+                    plot_sock = socket.create_connection(("127.0.0.1", args.plot_stream_port), timeout=0.5)
+                    plot_sock.setblocking(False)
+                    plot_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+                    plot_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+                except OSError:
+                    plot_sock = None
             log_status(f"startup: plot launch done sock={'ok' if plot_sock else 'none'}")
 
     with log_path.open("w", newline="", encoding="ascii") as f:
@@ -1255,7 +1265,7 @@ def _main(args, out_dir: Path, error_log: Path):
                 "buffer_size": int(len(buffer)),
                 "board_size": f"{config.grid_w}x{config.grid_h}",
             }
-            if plot_sock is not None:
+            if plot_sock is not None and not args.plot_no_stream:
                 try:
                     _, writable, _ = select.select([], [plot_sock], [], 0)
                     if writable:
@@ -1275,7 +1285,7 @@ def _main(args, out_dir: Path, error_log: Path):
             perf_train_ms = 0.0
             perf_count = 0
 
-        if plot_sock is None and args.live_plot and (now - last_stream_connect) >= 1.0:
+        if (not args.plot_no_stream) and plot_sock is None and args.live_plot and (now - last_stream_connect) >= 1.0:
             try:
                 plot_sock = socket.create_connection(("127.0.0.1", args.plot_stream_port), timeout=0.5)
                 plot_sock.setblocking(False)
@@ -1283,7 +1293,7 @@ def _main(args, out_dir: Path, error_log: Path):
                 plot_sock = None
             last_stream_connect = now
 
-        if plot_sock is not None and (now - last_stream_time) >= args.plot_stream_interval_sec:
+        if (not args.plot_no_stream) and plot_sock is not None and (now - last_stream_time) >= args.plot_stream_interval_sec:
             if recent_rewards:
                 mean_reward_live = float(np.mean(recent_rewards))
                 last_mean_reward = mean_reward_live
@@ -1384,7 +1394,7 @@ def _main(args, out_dir: Path, error_log: Path):
             except OSError:
                 plot_sock = None
 
-        if plot_sock is not None and last_stream_ok and (now - last_stream_ok) > 2.0:
+        if (not args.plot_no_stream) and plot_sock is not None and last_stream_ok and (now - last_stream_ok) > 2.0:
             try:
                 plot_sock.close()
             except OSError:
