@@ -409,7 +409,8 @@ def main():
         if global_step % args.target_update == 0:
             target.load_state_dict(qnet.state_dict())
 
-        if global_step - last_eval >= args.eval_interval:
+        training_started = buffer.size >= args.learning_starts
+        if training_started and (global_step - last_eval >= args.eval_interval):
             try:
                 max_len, mean_eval_reward = eval_policy(
                     qnet,
@@ -449,7 +450,7 @@ def main():
                 _log_error(error_log, f"save_checkpoint failed: {exc}")
             last_ckpt = global_step
 
-        if global_step - last_log >= args.log_interval:
+        if training_started and (global_step - last_log >= args.log_interval):
             now = time.time()
             runtime_sec = now - start_time
             fps = global_step / max(1e-6, runtime_sec)
@@ -494,7 +495,7 @@ def main():
                 "board_size": f"{args.grid}x{args.grid}",
                 "death_wall_per_k": death_wall_per_k,
                 "death_self_per_k": death_self_per_k,
-                "training_started": buffer.size >= args.learning_starts,
+                "training_started": training_started,
             }
             write_row(train_log, row, train_header, error_log=error_log)
 
