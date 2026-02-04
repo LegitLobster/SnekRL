@@ -209,6 +209,22 @@ def policy_value(model: nn.Module, obs: np.ndarray, device: torch.device, legal_
     return probs.cpu().numpy(), float(value.item())
 
 
+def policy_value_batch(
+    model: nn.Module,
+    obs_batch: np.ndarray,
+    device: torch.device,
+    legal_actions_list: List[List[int]],
+):
+    obs_t = torch.from_numpy(obs_batch).to(device)
+    with torch.no_grad():
+        logits, values = model(obs_t)
+    mask = torch.full_like(logits, -1e9)
+    for i, legal in enumerate(legal_actions_list):
+        mask[i, legal] = 0.0
+    probs = F.softmax(logits + mask, dim=1)
+    return probs.detach().cpu().numpy(), values.squeeze(1).detach().cpu().numpy()
+
+
 def select_child(node: MCTSNode, c_puct: float):
     best_score = -1e9
     best_action = None
@@ -285,6 +301,84 @@ def run_mcts(
     return counts
 
 
+def run_mcts_batch(
+    root_states: List[SnekState],
+    model: nn.Module,
+    device: torch.device,
+    sims: int,
+    c_puct: float,
+    dirichlet_alpha: float,
+    dirichlet_eps: float,
+    rng: np.random.Generator,
+    add_noise: bool,
+) -> np.ndarray:
+    n_roots = len(root_states)
+    if n_roots == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    roots = []
+    root_obs = np.stack([state.to_obs() for state in root_states], axis=0)
+    root_legal = [state.legal_actions() for state in root_states]
+    root_priors, _root_values = policy_value_batch(model, root_obs, device, root_legal)
+    for i in range(n_roots):
+        root = MCTSNode(0.0)
+        root.expand(root_priors[i], root_legal[i])
+        if add_noise:
+            add_dirichlet_noise(root, dirichlet_alpha, dirichlet_eps, rng)
+        roots.append(root)
+
+    for _ in range(sims):
+        paths = []
+        leaf_states = []
+        leaf_meta = []
+        for i, root in enumerate(roots):
+            node = root
+            state = root_states[i].clone()
+            search_path = [node]
+            done = False
+
+            while node.children:
+                action, child = select_child(node, c_puct)
+                if child is None:
+                    break
+                _reward, done, _info = state.step(action)
+                node = child
+                search_path.append(node)
+                if done:
+                    break
+
+            if done:
+                value = outcome_value(state)
+                paths.append((search_path, value, None))
+            else:
+                leaf_idx = len(leaf_states)
+                leaf_states.append(state)
+                leaf_meta.append((node, state.legal_actions()))
+                paths.append((search_path, None, leaf_idx))
+
+        if leaf_states:
+            obs_batch = np.stack([state.to_obs() for state in leaf_states], axis=0)
+            priors_batch, values_batch = policy_value_batch(model, obs_batch, device, [m[1] for m in leaf_meta])
+        else:
+            priors_batch = None
+            values_batch = None
+
+        for search_path, value, leaf_idx in paths:
+            if value is None and leaf_idx is not None:
+                node, legal = leaf_meta[leaf_idx]
+                node.expand(priors_batch[leaf_idx], legal)
+                value = float(values_batch[leaf_idx])
+            for n in search_path:
+                n.visit_count += 1
+                n.value_sum += value
+
+    counts = np.zeros((n_roots, 4), dtype=np.float32)
+    for i, root in enumerate(roots):
+        for action, child in root.children.items():
+            counts[i, action] = float(child.visit_count)
+    return counts
+
+
 def select_action_from_policy(policy: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
     if temperature <= 0.0:
         return int(policy.argmax())
@@ -357,6 +451,91 @@ def self_play_episode(
     return examples, ep_reward, ep_len, ep_max_len, death_type
 
 
+def self_play_batch(
+    model: nn.Module,
+    device: torch.device,
+    config: SnekConfig,
+    sims: int,
+    c_puct: float,
+    dirichlet_alpha: float,
+    dirichlet_eps: float,
+    temperature: float,
+    temp_threshold: int,
+    rng: np.random.Generator,
+    seed: int,
+    max_steps: int,
+    batch_size: int,
+    status_hook=None,
+    status_interval: int = 10,
+):
+    states = [SnekState.new(config, seed=seed + i * 9973) for i in range(batch_size)]
+    episodes = [[] for _ in range(batch_size)]
+    ep_rewards = [0.0 for _ in range(batch_size)]
+    ep_lengths = [0 for _ in range(batch_size)]
+    ep_max_lens = [state.length for state in states]
+    death_types = [None for _ in range(batch_size)]
+    active = [True for _ in range(batch_size)]
+    total_steps = 0
+    steps_since_status = 0
+
+    while any(active):
+        active_idx = [i for i, a in enumerate(active) if a]
+        active_states = [states[i] for i in active_idx]
+        counts_batch = run_mcts_batch(
+            active_states,
+            model,
+            device,
+            sims,
+            c_puct,
+            dirichlet_alpha,
+            dirichlet_eps,
+            rng,
+            add_noise=True,
+        )
+
+        policies = []
+        for j, i in enumerate(active_idx):
+            counts = counts_batch[j]
+            total = float(counts.sum())
+            if total > 0:
+                policy = counts / total
+            else:
+                policy = np.full((4,), 0.25, dtype=np.float32)
+            policies.append(policy)
+            episodes[i].append((states[i].to_obs(), policy))
+
+        for j, i in enumerate(active_idx):
+            temp = temperature if ep_lengths[i] < temp_threshold else 0.0
+            action = select_action_from_policy(policies[j], temp, rng)
+            reward, done, info = states[i].step(action)
+            ep_rewards[i] += reward
+            ep_lengths[i] += 1
+            ep_max_lens[i] = max(ep_max_lens[i], int(info.get("length", states[i].length)))
+            total_steps += 1
+            steps_since_status += 1
+
+            if done or ep_lengths[i] >= max_steps:
+                active[i] = False
+                if done:
+                    death_types[i] = info.get("death")
+
+        if status_hook is not None and steps_since_status >= status_interval:
+            last_reward = ep_rewards[active_idx[0]] if active_idx else 0.0
+            last_max_len = max(ep_max_lens) if ep_max_lens else 0
+            status_hook(total_steps, last_reward, last_max_len)
+            steps_since_status = 0
+
+    examples_all = []
+    for i, episode in enumerate(episodes):
+        if not episode:
+            continue
+        outcome = outcome_value(states[i])
+        for obs, policy in episode:
+            examples_all.append((obs, policy, outcome))
+
+    return examples_all, ep_rewards, ep_lengths, ep_max_lens, death_types, total_steps
+
+
 def eval_episode(
     model: nn.Module,
     device: torch.device,
@@ -408,6 +587,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--temp-threshold", type=int, default=30)
     parser.add_argument("--max-episode-steps", type=int, default=1000)
+    parser.add_argument("--selfplay-batch", type=int, default=1)
     parser.add_argument("--replay-size", type=int, default=50_000)
     parser.add_argument("--replay-warmup", type=int, default=5_000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -576,12 +756,12 @@ def main():
     }
     status_lock = threading.Lock()
 
-    def status_update(ep_len: int, ep_reward: float, ep_max_len: int):
+    def status_update(step_progress: int, ep_reward: float, ep_max_len: int):
         with status_lock:
-            status_state["steps"] = global_step + ep_len
+            status_state["steps"] = global_step + step_progress
             status_state["replay"] = len(replay)
             status_state["training_started"] = len(replay) >= args.replay_warmup
-            status_state["last_ep_len"] = ep_len
+            status_state["last_ep_len"] = step_progress
             status_state["last_ep_reward"] = ep_reward
             status_state["last_ep_max_len"] = ep_max_len
 
@@ -598,38 +778,91 @@ def main():
     while global_step < target_steps:
         model.eval()
         seed = py_rng.randrange(1 << 30)
-        examples, ep_reward, ep_len, ep_max_len, death_type = self_play_episode(
-            model,
-            device,
-            config,
-            args.mcts_sims,
-            args.c_puct,
-            args.dirichlet_alpha,
-            args.dirichlet_eps,
-            args.temperature,
-            args.temp_threshold,
-            np_rng,
-            seed,
-            args.max_episode_steps,
-            status_hook=status_update,
-            status_interval=10,
-        )
+        if args.selfplay_batch <= 1:
+            examples, ep_reward, ep_len, ep_max_len, death_type = self_play_episode(
+                model,
+                device,
+                config,
+                args.mcts_sims,
+                args.c_puct,
+                args.dirichlet_alpha,
+                args.dirichlet_eps,
+                args.temperature,
+                args.temp_threshold,
+                np_rng,
+                seed,
+                args.max_episode_steps,
+                status_hook=status_update,
+                status_interval=10,
+            )
 
-        if ep_len <= 0:
-            continue
+            if ep_len <= 0:
+                continue
 
-        replay.add_many(examples)
-        global_step += ep_len
-        death_steps_window += ep_len
+            replay.add_many(examples)
+            global_step += ep_len
+            death_steps_window += ep_len
 
-        stats.ep_rewards.append(float(ep_reward))
-        stats.ep_lengths.append(int(ep_len))
-        stats.ep_max_lens.append(int(ep_max_len))
-        stats.best_train_max_len = max(stats.best_train_max_len, int(ep_max_len))
-        if death_type == "wall":
-            death_wall_window += 1
-        elif death_type == "self":
-            death_self_window += 1
+            stats.ep_rewards.append(float(ep_reward))
+            stats.ep_lengths.append(int(ep_len))
+            stats.ep_max_lens.append(int(ep_max_len))
+            stats.best_train_max_len = max(stats.best_train_max_len, int(ep_max_len))
+            if death_type == "wall":
+                death_wall_window += 1
+            elif death_type == "self":
+                death_self_window += 1
+            last_ep_len = ep_len
+            last_ep_reward = ep_reward
+            last_ep_max_len = ep_max_len
+        else:
+            (
+                examples_all,
+                ep_rewards,
+                ep_lengths,
+                ep_max_lens,
+                death_types,
+                steps_taken,
+            ) = self_play_batch(
+                model,
+                device,
+                config,
+                args.mcts_sims,
+                args.c_puct,
+                args.dirichlet_alpha,
+                args.dirichlet_eps,
+                args.temperature,
+                args.temp_threshold,
+                np_rng,
+                seed,
+                args.max_episode_steps,
+                args.selfplay_batch,
+                status_hook=status_update,
+                status_interval=10,
+            )
+
+            if steps_taken <= 0:
+                continue
+
+            replay.add_many(examples_all)
+            global_step += steps_taken
+            death_steps_window += steps_taken
+
+            for ep_reward, ep_len, ep_max_len, death_type in zip(
+                ep_rewards, ep_lengths, ep_max_lens, death_types
+            ):
+                if ep_len <= 0:
+                    continue
+                stats.ep_rewards.append(float(ep_reward))
+                stats.ep_lengths.append(int(ep_len))
+                stats.ep_max_lens.append(int(ep_max_len))
+                stats.best_train_max_len = max(stats.best_train_max_len, int(ep_max_len))
+                if death_type == "wall":
+                    death_wall_window += 1
+                elif death_type == "self":
+                    death_self_window += 1
+            last_ep_len = int(ep_lengths[-1]) if ep_lengths else 0
+            last_ep_reward = float(ep_rewards[-1]) if ep_rewards else 0.0
+            last_ep_max_len = int(ep_max_lens[-1]) if ep_max_lens else 0
 
         training_started = len(replay) >= args.replay_warmup
         now = time.time()
@@ -638,9 +871,9 @@ def main():
                 status_state["steps"] = global_step
                 status_state["replay"] = len(replay)
                 status_state["training_started"] = training_started
-                status_state["last_ep_len"] = ep_len
-                status_state["last_ep_reward"] = ep_reward
-                status_state["last_ep_max_len"] = ep_max_len
+                status_state["last_ep_len"] = last_ep_len
+                status_state["last_ep_reward"] = last_ep_reward
+                status_state["last_ep_max_len"] = last_ep_max_len
             last_status_time = now
 
         if not log_ready and len(replay) >= args.replay_warmup:
