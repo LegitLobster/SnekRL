@@ -3,26 +3,15 @@ import csv
 import math
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from snek_env import SnekConfig
 from snek_env_gpu import SnekEnvGPU
-
-
-@dataclass
-class TrainStats:
-    ep_rewards: List[float]
-    ep_lengths: List[int]
-    ep_max_lens: List[int]
-    best_train_max_len: int = 0
-    best_eval_max_len: int = 0
 
 
 class QNet(nn.Module):
@@ -160,8 +149,7 @@ def write_row(path: Path, row: dict, header: List[str], error_log: Optional[Path
             _log_error(error_log, f"write_row failed for {path}: {exc}")
 
 
-def eval_policy(qnet, device, grid, episodes, max_steps):
-    env = SnekEnvGPU(1, SnekConfig(grid_w=grid, grid_h=grid), device)
+def eval_policy(qnet, device, env, episodes, max_steps):
     qnet.eval()
     total_reward = 0.0
     max_len = 0
@@ -221,8 +209,11 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     env = SnekEnvGPU(args.n_envs, SnekConfig(grid_w=args.grid, grid_h=args.grid), device)
+    eval_env = SnekEnvGPU(1, SnekConfig(grid_w=args.grid, grid_h=args.grid), device)
     obs = env.reset()
     obs_shape = obs.shape[1:]
     n_actions = 4
@@ -314,17 +305,22 @@ def main():
         except Exception:
             pass
 
-    stats = TrainStats(ep_rewards=[], ep_lengths=[], ep_max_lens=[])
     save_state = {"thread": None, "last_error": None}
-    death_wall_window = 0
-    death_self_window = 0
+    death_wall_window_t = torch.zeros((), dtype=torch.int32, device=device)
+    death_self_window_t = torch.zeros((), dtype=torch.int32, device=device)
     death_steps_window = 0
     best_train_rate = 0.0
     best_eval_rate = 0.0
+    best_eval_max_len = 0
 
     cur_ep_rewards = torch.zeros(args.n_envs, dtype=torch.float32, device=device)
     cur_ep_lengths = torch.zeros(args.n_envs, dtype=torch.int32, device=device)
     cur_ep_max_len = torch.zeros(args.n_envs, dtype=torch.int32, device=device)
+    ep_reward_sum = torch.zeros((), dtype=torch.float32, device=device)
+    ep_len_sum = torch.zeros((), dtype=torch.float32, device=device)
+    ep_max_len_sum = torch.zeros((), dtype=torch.float32, device=device)
+    ep_count = torch.zeros((), dtype=torch.int32, device=device)
+    best_train_max_len_t = torch.zeros((), dtype=torch.int32, device=device)
 
     start_time = time.time()
     last_log = start_step
@@ -361,18 +357,19 @@ def main():
         cur_ep_max_len = torch.maximum(cur_ep_max_len, info["length"].to(torch.int32))
 
         done_mask = done.to(torch.bool)
+        death_wall_window_t += info["death_wall"].to(torch.int32).sum()
+        death_self_window_t += info["death_self"].to(torch.int32).sum()
         if done_mask.any():
             done_idx = torch.where(done_mask)[0]
             if done_idx.numel() > 0:
-                ep_rewards = cur_ep_rewards[done_idx].cpu().tolist()
-                ep_lengths = cur_ep_lengths[done_idx].cpu().tolist()
-                ep_max_lens = cur_ep_max_len[done_idx].cpu().tolist()
-                stats.ep_rewards.extend(ep_rewards)
-                stats.ep_lengths.extend(ep_lengths)
-                stats.ep_max_lens.extend(ep_max_lens)
-                stats.best_train_max_len = max(stats.best_train_max_len, int(max(ep_max_lens)))
-                death_wall_window += int(info["death_wall"][done_idx].sum().item())
-                death_self_window += int(info["death_self"][done_idx].sum().item())
+                done_rewards = cur_ep_rewards[done_idx]
+                done_lengths = cur_ep_lengths[done_idx].to(torch.float32)
+                done_max_lens = cur_ep_max_len[done_idx].to(torch.float32)
+                ep_reward_sum += done_rewards.sum()
+                ep_len_sum += done_lengths.sum()
+                ep_max_len_sum += done_max_lens.sum()
+                ep_count += done_idx.numel()
+                best_train_max_len_t = torch.maximum(best_train_max_len_t, cur_ep_max_len[done_idx].max())
 
                 cur_ep_rewards[done_idx] = 0.0
                 cur_ep_lengths[done_idx] = 0
@@ -410,11 +407,11 @@ def main():
                 max_len, mean_eval_reward = eval_policy(
                     qnet,
                     device,
-                    args.grid,
+                    eval_env,
                     args.eval_episodes,
                     args.eval_max_steps,
                 )
-                stats.best_eval_max_len = max(stats.best_eval_max_len, int(max_len))
+                best_eval_max_len = max(best_eval_max_len, int(max_len))
                 write_row(
                     eval_log,
                     {"steps": global_step, "max_len": max_len, "mean_eval_reward": mean_eval_reward},
@@ -450,27 +447,30 @@ def main():
             runtime_sec = now - start_time
             fps = global_step / max(1e-6, runtime_sec)
 
-            if stats.ep_rewards:
-                mean_reward = float(np.mean(stats.ep_rewards))
-                mean_len = float(np.mean(stats.ep_lengths))
-                mean_max_len = float(np.mean(stats.ep_max_lens))
+            count = int(ep_count.item())
+            if count > 0:
+                mean_reward = float((ep_reward_sum / count).item())
+                mean_len = float((ep_len_sum / count).item())
+                mean_max_len = float((ep_max_len_sum / count).item())
             else:
                 mean_reward = 0.0
                 mean_len = 0.0
                 mean_max_len = 0.0
 
-            if stats.best_train_max_len > last_best_len:
+            best_train_max_len = int(best_train_max_len_t.item())
+            if best_train_max_len > last_best_len:
                 dt_min = max(1e-6, (now - last_best_time) / 60.0)
-                best_train_rate = (stats.best_train_max_len - last_best_len) / dt_min
-                last_best_len = stats.best_train_max_len
+                best_train_rate = (best_train_max_len - last_best_len) / dt_min
+                last_best_len = best_train_max_len
                 last_best_time = now
-            if stats.best_eval_max_len > 0:
-                best_eval_rate = stats.best_eval_max_len / max(1e-6, runtime_sec / 60.0)
+            if best_eval_max_len > 0:
+                best_eval_rate = best_eval_max_len / max(1e-6, runtime_sec / 60.0)
 
-            death_wall_per_k = (death_wall_window / max(1, death_steps_window)) * 1000.0
-            death_self_per_k = (death_self_window / max(1, death_steps_window)) * 1000.0
-            death_wall_window = 0
-            death_self_window = 0
+            denom = max(1, death_steps_window)
+            death_wall_per_k = float((death_wall_window_t / denom * 1000.0).item())
+            death_self_per_k = float((death_self_window_t / denom * 1000.0).item())
+            death_wall_window_t.zero_()
+            death_self_window_t.zero_()
             death_steps_window = 0
 
             row = {
@@ -481,8 +481,8 @@ def main():
                 "mean_reward": mean_reward,
                 "mean_len": mean_len,
                 "mean_max_len": mean_max_len,
-                "best_train_max_len": stats.best_train_max_len,
-                "best_eval_max_len": stats.best_eval_max_len,
+                "best_train_max_len": best_train_max_len,
+                "best_eval_max_len": best_eval_max_len,
                 "best_train_rate_per_min": best_train_rate,
                 "best_eval_rate_per_min": best_eval_rate,
                 "loss": float(loss.item()),
@@ -494,9 +494,10 @@ def main():
             }
             write_row(train_log, row, train_header, error_log=error_log)
 
-            stats.ep_rewards.clear()
-            stats.ep_lengths.clear()
-            stats.ep_max_lens.clear()
+            ep_reward_sum.zero_()
+            ep_len_sum.zero_()
+            ep_max_len_sum.zero_()
+            ep_count.zero_()
             last_log = global_step
 
             if stop_path is not None:
