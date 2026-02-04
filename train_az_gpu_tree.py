@@ -468,6 +468,7 @@ def mcts_search_batch(
     dirichlet_eps: float,
     device: torch.device,
     max_nodes_per_root: int,
+    max_depth: int,
 ):
     batch = root_state["body_age"].shape[0]
     grid_w = int(config.grid_w)
@@ -475,7 +476,7 @@ def mcts_search_batch(
     grid_cells = grid_w * grid_h
 
     total_nodes = batch * max_nodes_per_root
-    child_index = torch.full((total_nodes, 4), -1, dtype=torch.int32, device=device)
+    child_index = torch.full((total_nodes, 4), -1, dtype=torch.int64, device=device)
     child_prior = torch.zeros((total_nodes, 4), dtype=torch.float32, device=device)
     node_visit = torch.zeros((total_nodes,), dtype=torch.float32, device=device)
     node_value_sum = torch.zeros((total_nodes,), dtype=torch.float32, device=device)
@@ -524,42 +525,43 @@ def mcts_search_batch(
     dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
     opposite = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=device)
 
-    next_free = [int(r.item()) + 1 for r in roots]
+    next_free = roots + 1
+
     for _ in range(sims):
-        paths = [[] for _ in range(batch)]
         cur_nodes = roots.clone()
-        done_mask = torch.zeros((batch,), dtype=torch.bool, device=device)
         values = torch.zeros((batch,), dtype=torch.float32, device=device)
+        done_mask = torch.zeros((batch,), dtype=torch.bool, device=device)
+        path_nodes = torch.full((batch, max_depth), -1, dtype=torch.int64, device=device)
 
-        while not bool(done_mask.all()):
-            for i in range(batch):
-                if not bool(done_mask[i].item()):
-                    paths[i].append(int(cur_nodes[i].item()))
+        for depth in range(max_depth):
+            active = ~done_mask
+            if not bool(active.any()):
+                break
 
-            term_mask = node_terminal[cur_nodes] & ~done_mask
-            if bool(term_mask.any()):
-                term_idx = term_mask.nonzero(as_tuple=False).squeeze(1)
-                term_nodes = cur_nodes[term_idx]
-                values[term_idx] = outcome_value_tensor(length[term_nodes], grid_cells)
-                done_mask[term_idx] = True
+            path_nodes[active, depth] = cur_nodes[active]
 
-            eval_mask = (~node_expanded[cur_nodes]) & ~done_mask
+            term = node_terminal[cur_nodes] & active
+            if bool(term.any()):
+                term_nodes = cur_nodes[term]
+                values[term] = outcome_value_tensor(length[term_nodes], grid_cells)
+                done_mask[term] = True
+
+            eval_mask = (~node_expanded[cur_nodes]) & active
             if bool(eval_mask.any()):
-                eval_idx = eval_mask.nonzero(as_tuple=False).squeeze(1)
-                eval_nodes = cur_nodes[eval_idx]
+                eval_nodes = cur_nodes[eval_mask]
                 obs = build_obs(body_age[eval_nodes], food_x[eval_nodes], food_y[eval_nodes], wall_mask)
                 legal = legal_mask_from_dir(direction[eval_nodes])
                 priors, vals = policy_value_batch(model, obs, legal)
                 child_prior[eval_nodes] = priors
                 node_expanded[eval_nodes] = True
-                values[eval_idx] = vals
-                done_mask[eval_idx] = True
+                values[eval_mask] = vals
+                done_mask[eval_mask] = True
 
-            active_mask = ~done_mask
-            if not bool(active_mask.any()):
+            active = ~done_mask
+            if not bool(active.any()):
                 break
 
-            active_idx = active_mask.nonzero(as_tuple=False).squeeze(1)
+            active_idx = active.nonzero(as_tuple=False).squeeze(1)
             active_nodes = cur_nodes[active_idx]
             actions = select_puct(active_nodes, child_index, child_prior, node_visit, node_value_sum, direction, c_puct)
             child = child_index[active_nodes, actions]
@@ -567,38 +569,36 @@ def mcts_search_batch(
             need_new = child < 0
             if bool(need_new.any()):
                 new_idx = active_idx[need_new]
-                new_nodes = []
-                for i in new_idx.tolist():
-                    root_id = int(i)
-                    base = int(roots[root_id].item())
-                    if next_free[root_id] >= base + max_nodes_per_root:
-                        new_nodes.append(-1)
-                    else:
-                        new_nodes.append(next_free[root_id])
-                        next_free[root_id] += 1
+                parent_nodes = active_nodes[need_new]
+                parent_actions = actions[need_new]
+                root_ids = (parent_nodes // max_nodes_per_root).to(torch.int64)
+                alloc = next_free[root_ids]
+                limit = roots[root_ids] + max_nodes_per_root
+                valid = alloc < limit
+                new_nodes = torch.where(valid, alloc, torch.full_like(alloc, -1))
+                next_free[root_ids] = torch.where(valid, alloc + 1, alloc)
 
-                new_nodes_tensor = torch.tensor(new_nodes, dtype=torch.int64, device=device)
-                valid_new = new_nodes_tensor >= 0
-
-                if bool(valid_new.any()):
-                    valid_idx = new_idx[valid_new]
-                    valid_nodes = new_nodes_tensor[valid_new]
-                    parent_nodes = active_nodes[need_new][valid_new]
-                    parent_actions = actions[need_new][valid_new]
+                if bool(valid.any()):
+                    valid_idx = new_idx[valid]
+                    valid_nodes = new_nodes[valid]
+                    valid_parent_nodes = parent_nodes[valid]
+                    valid_parent_actions = parent_actions[valid]
 
                     parent_state = {
-                        "body_age": body_age[parent_nodes],
-                        "length": length[parent_nodes],
-                        "head_x": head_x[parent_nodes],
-                        "head_y": head_y[parent_nodes],
-                        "direction": direction[parent_nodes],
-                        "food_x": food_x[parent_nodes],
-                        "food_y": food_y[parent_nodes],
-                        "steps_since_food": steps_since_food[parent_nodes],
-                        "rng_state": rng_state[parent_nodes],
+                        "body_age": body_age[valid_parent_nodes],
+                        "length": length[valid_parent_nodes],
+                        "head_x": head_x[valid_parent_nodes],
+                        "head_y": head_y[valid_parent_nodes],
+                        "direction": direction[valid_parent_nodes],
+                        "food_x": food_x[valid_parent_nodes],
+                        "food_y": food_y[valid_parent_nodes],
+                        "steps_since_food": steps_since_food[valid_parent_nodes],
+                        "rng_state": rng_state[valid_parent_nodes],
                     }
 
-                    next_state, _rewards, done, _info = step_state(parent_state, parent_actions, config, dx, dy, opposite)
+                    next_state, _rewards, done, _info = step_state(
+                        parent_state, valid_parent_actions, config, dx, dy, opposite
+                    )
                     body_age[valid_nodes] = next_state["body_age"]
                     length[valid_nodes] = next_state["length"]
                     head_x[valid_nodes] = next_state["head_x"]
@@ -610,7 +610,7 @@ def mcts_search_batch(
                     rng_state[valid_nodes] = next_state["rng_state"]
 
                     node_terminal[valid_nodes] = done
-                    child_index[parent_nodes, parent_actions] = valid_nodes.to(torch.int32)
+                    child_index[valid_parent_nodes, valid_parent_actions] = valid_nodes
 
                     obs = build_obs(body_age[valid_nodes], food_x[valid_nodes], food_y[valid_nodes], wall_mask)
                     legal = legal_mask_from_dir(direction[valid_nodes])
@@ -621,35 +621,38 @@ def mcts_search_batch(
                     values[valid_idx] = torch.where(done, outcome_value_tensor(length[valid_nodes], grid_cells), vals)
                     done_mask[valid_idx] = True
 
-                    for idx, node_id in zip(valid_idx.tolist(), valid_nodes.tolist()):
-                        paths[idx].append(int(node_id))
-
-                invalid_mask = ~valid_new
-                if bool(invalid_mask.any()):
-                    invalid_idx = new_idx[invalid_mask]
+                invalid = ~valid
+                if bool(invalid.any()):
+                    invalid_idx = new_idx[invalid]
                     values[invalid_idx] = outcome_value_tensor(length[cur_nodes[invalid_idx]], grid_cells)
                     done_mask[invalid_idx] = True
 
-            follow_mask = ~need_new
-            if bool(follow_mask.any()):
-                follow_idx = active_idx[follow_mask]
-                follow_child = child[follow_mask].to(torch.int64)
+            follow = ~need_new
+            if bool(follow.any()):
+                follow_idx = active_idx[follow]
+                follow_child = child[follow]
                 cur_nodes[follow_idx] = follow_child
 
-        for i in range(batch):
-            value = float(values[i].item())
-            for node in paths[i]:
-                node_visit[node] += 1.0
-                node_value_sum[node] += value
+        leftover = ~done_mask
+        if bool(leftover.any()):
+            eval_nodes = cur_nodes[leftover]
+            obs = build_obs(body_age[eval_nodes], food_x[eval_nodes], food_y[eval_nodes], wall_mask)
+            legal = legal_mask_from_dir(direction[eval_nodes])
+            _priors, vals = policy_value_batch(model, obs, legal)
+            values[leftover] = vals
+
+        values_rep = values.view(batch, 1).expand(batch, max_depth)
+        mask = path_nodes >= 0
+        flat_nodes = path_nodes[mask].view(-1)
+        flat_values = values_rep[mask].view(-1)
+        if flat_nodes.numel() > 0:
+            node_visit.index_add_(0, flat_nodes, torch.ones_like(flat_values))
+            node_value_sum.index_add_(0, flat_nodes, flat_values)
 
     counts = torch.zeros((batch, 4), dtype=torch.float32, device=device)
-    for i in range(batch):
-        root = int(roots[i].item())
-        for a in range(4):
-            child = int(child_index[root, a].item())
-            if child >= 0:
-                counts[i, a] = node_visit[child]
-
+    root_children = child_index[roots]
+    child_visits = node_visit[torch.clamp(root_children, min=0)]
+    counts = torch.where(root_children >= 0, child_visits, counts)
     return counts
 
 def select_action_from_policy(policy: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
@@ -678,15 +681,16 @@ def self_play_batch_gpu(
     max_steps: int,
     batch_size: int,
     max_nodes_per_root: int,
+    max_depth: int,
     status_hook=None,
     status_interval: int = 10,
 ):
     state = init_state(batch_size, config, device, seed)
     episodes = [[] for _ in range(batch_size)]
-    ep_rewards = [0.0 for _ in range(batch_size)]
-    ep_lengths = [0 for _ in range(batch_size)]
-    ep_max_lens = [int(state["length"][i].item()) for i in range(batch_size)]
-    death_types = [None for _ in range(batch_size)]
+    ep_rewards = torch.zeros((batch_size,), dtype=torch.float32, device=device)
+    ep_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+    ep_max_lens = state["length"].to(torch.int32)
+    death_types = torch.full((batch_size,), -1, dtype=torch.int8, device=device)
 
     active = torch.ones((batch_size,), dtype=torch.bool, device=device)
     total_steps = 0
@@ -729,47 +733,56 @@ def self_play_batch_gpu(
             dirichlet_eps,
             device,
             max_nodes_per_root,
+            max_depth=max_depth,
         )
 
         obs = build_obs(root_state["body_age"], root_state["food_x"], root_state["food_y"], wall_mask)
+
+        totals = counts.sum(dim=1, keepdim=True)
+        policy = torch.where(totals > 0, counts / totals, torch.full_like(counts, 0.25))
+        temps = torch.where(ep_lengths[active_idx] < temp_threshold, torch.tensor(temperature, device=device), torch.tensor(0.0, device=device))
+        temp_mask = temps > 0
+        actions = policy.argmax(dim=1)
+        if bool(temp_mask.any().item()):
+            scaled = policy.clone()
+            scaled[temp_mask] = scaled[temp_mask] ** (1.0 / temps[temp_mask].unsqueeze(1))
+            scaled_sum = scaled[temp_mask].sum(dim=1, keepdim=True).clamp(min=1e-6)
+            scaled[temp_mask] = scaled[temp_mask] / scaled_sum
+            actions[temp_mask] = torch.multinomial(scaled[temp_mask], 1).squeeze(1)
+
         obs_cpu = obs.detach().cpu().numpy()
-        counts_cpu = counts.detach().cpu().numpy()
+        policy_cpu = policy.detach().cpu().numpy()
+        for j, idx in enumerate(active_idx.tolist()):
+            episodes[idx].append((obs_cpu[j], policy_cpu[j]))
 
-        actions = []
-        for i, idx in enumerate(active_idx.tolist()):
-            total = float(counts_cpu[i].sum())
-            if total > 0:
-                policy = counts_cpu[i] / total
-            else:
-                policy = np.full((4,), 0.25, dtype=np.float32)
-            temp = temperature if ep_lengths[idx] < temp_threshold else 0.0
-            action = select_action_from_policy(policy, temp, rng)
-            actions.append(action)
-            episodes[idx].append((obs_cpu[i], policy))
-
-        actions_t = torch.tensor(actions, dtype=torch.int16, device=device)
+        actions_t = actions.to(torch.int16)
         next_state, rewards, done, info = step_state(root_state, actions_t, config, dx, dy, opposite)
 
-        for i, idx in enumerate(active_idx.tolist()):
-            ep_rewards[idx] += float(rewards[i].item())
-            ep_lengths[idx] += 1
-            ep_max_lens[idx] = max(ep_max_lens[idx], int(info["length"][i].item()))
-            total_steps += 1
-            steps_since_status += 1
-            if bool(done[i].item()) or ep_lengths[idx] >= max_steps:
-                active[idx] = False
-                if bool(done[i].item()):
-                    if bool(info["death_wall"][i].item()):
-                        death_types[idx] = "wall"
-                    elif bool(info["death_self"][i].item()):
-                        death_types[idx] = "self"
+        ep_rewards[active_idx] += rewards
+        ep_lengths[active_idx] += 1
+        ep_max_lens[active_idx] = torch.maximum(ep_max_lens[active_idx], info["length"].to(torch.int32))
+        total_steps += int(active_idx.numel())
+        steps_since_status += int(active_idx.numel())
+
+        done_now = done | (ep_lengths[active_idx] >= max_steps)
+        if bool(done_now.any().item()):
+            done_idx = active_idx[done_now]
+            wall = info["death_wall"][done_now]
+            self_hit = info["death_self"][done_now]
+            death_types[done_idx] = torch.where(wall, torch.tensor(0, dtype=torch.int8, device=device), death_types[done_idx])
+            death_types[done_idx] = torch.where(self_hit, torch.tensor(1, dtype=torch.int8, device=device), death_types[done_idx])
+            active[done_idx] = False
 
         for k in state:
             state[k][active_idx] = next_state[k]
 
         if status_hook is not None and steps_since_status >= status_interval:
-            last_reward = ep_rewards[active_idx[0].item()] if active_idx.numel() > 0 else 0.0
-            last_max_len = max(ep_max_lens) if ep_max_lens else 0
+            if active_idx.numel() > 0:
+                last_reward = float(ep_rewards[active_idx[0]].item())
+                last_max_len = int(ep_max_lens.max().item())
+            else:
+                last_reward = 0.0
+                last_max_len = 0
             status_hook(total_steps, last_reward, last_max_len)
             steps_since_status = 0
 
@@ -781,7 +794,14 @@ def self_play_batch_gpu(
         for obs, policy in episode:
             examples_all.append((obs, policy, float(outcome)))
 
-    return examples_all, ep_rewards, ep_lengths, ep_max_lens, death_types, total_steps
+    return (
+        examples_all,
+        ep_rewards.detach().cpu().tolist(),
+        ep_lengths.detach().cpu().tolist(),
+        ep_max_lens.detach().cpu().tolist(),
+        death_types.detach().cpu().tolist(),
+        total_steps,
+    )
 
 def eval_episode_gpu(
     model: nn.Module,
@@ -793,6 +813,7 @@ def eval_episode_gpu(
     seed: int,
     max_steps: int,
     max_nodes_per_root: int,
+    max_depth: int,
 ):
     state = init_state(1, config, device, seed)
     done = False
@@ -815,6 +836,7 @@ def eval_episode_gpu(
             dirichlet_eps=0.0,
             device=device,
             max_nodes_per_root=max_nodes_per_root,
+            max_depth=max_depth,
         )
         counts_cpu = counts.detach().cpu().numpy()[0]
         action = int(counts_cpu.argmax()) if counts_cpu.sum() > 0 else 0
@@ -836,6 +858,7 @@ def main():
     parser.add_argument("--timesteps", type=int, default=1_000_000)
     parser.add_argument("--mcts-sims", type=int, default=64)
     parser.add_argument("--mcts-max-nodes", type=int, default=512)
+    parser.add_argument("--mcts-max-depth", type=int, default=32)
     parser.add_argument("--c-puct", type=float, default=1.5)
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3)
     parser.add_argument("--dirichlet-eps", type=float, default=0.25)
@@ -1055,6 +1078,7 @@ def main():
             args.max_episode_steps,
             args.selfplay_batch,
             args.mcts_max_nodes,
+            args.mcts_max_depth,
             status_hook=status_update,
             status_interval=10,
         )
@@ -1073,9 +1097,9 @@ def main():
             stats.ep_lengths.append(int(ep_len))
             stats.ep_max_lens.append(int(ep_max_len))
             stats.best_train_max_len = max(stats.best_train_max_len, int(ep_max_len))
-            if death_type == "wall":
+            if death_type == 0:
                 death_wall_window += 1
-            elif death_type == "self":
+            elif death_type == 1:
                 death_self_window += 1
 
         last_ep_len = int(ep_lengths[-1]) if ep_lengths else 0
@@ -1143,6 +1167,7 @@ def main():
                         seed,
                         args.eval_max_steps,
                         args.mcts_max_nodes,
+                        args.mcts_max_depth,
                     )
                     eval_max_len = max(eval_max_len, int(ep_max_len))
                     total_eval_reward += float(ep_reward)
