@@ -309,7 +309,9 @@ def build_obs(body_age: torch.Tensor, food_x: torch.Tensor, food_y: torch.Tensor
     b, h, w = body_age.shape
     food_mask = torch.zeros((b, h, w), dtype=torch.bool, device=body_age.device)
     idx = torch.arange(b, device=body_age.device)
-    food_mask[idx, food_y.to(torch.int64), food_x.to(torch.int64)] = True
+    fx = food_x.to(torch.int64).clamp(0, w - 1)
+    fy = food_y.to(torch.int64).clamp(0, h - 1)
+    food_mask[idx, fy, fx] = True
 
     obs = torch.stack(
         [
@@ -659,20 +661,26 @@ def mcts_search_batch(
 
     wall_mask = workspace.wall_mask
 
-    obs_root = build_obs(body_age[roots], food_x[roots], food_y[roots], wall_mask)
-    legal_mask = legal_mask_from_dir(direction[roots], workspace.legal_mask_table)
-    needs_expand = ~node_expanded[roots]
     if active_mask is not None:
-        needs_expand = needs_expand & active_mask
-    if bool(needs_expand.any().item()):
-        root_priors, _root_values = policy_value_batch(model, obs_root[needs_expand], legal_mask[needs_expand])
-        child_prior[roots[needs_expand]] = root_priors
-        node_expanded[roots[needs_expand]] = True
+        active_roots = roots[active_mask]
     else:
-        root_priors = child_prior[roots]
-    if dirichlet_eps > 0 and dirichlet_alpha > 0:
-        noise = torch.distributions.Dirichlet(torch.full((4,), dirichlet_alpha, device=device)).sample((batch,))
-        child_prior[roots] = child_prior[roots] * (1.0 - dirichlet_eps) + noise * dirichlet_eps
+        active_roots = roots
+
+    if active_roots.numel() > 0:
+        obs_root = build_obs(body_age[active_roots], food_x[active_roots], food_y[active_roots], wall_mask)
+        legal_mask = legal_mask_from_dir(direction[active_roots], workspace.legal_mask_table)
+        needs_expand = ~node_expanded[active_roots]
+        if bool(needs_expand.any().item()):
+            root_priors, _root_values = policy_value_batch(
+                model, obs_root[needs_expand], legal_mask[needs_expand]
+            )
+            child_prior[active_roots[needs_expand]] = root_priors
+            node_expanded[active_roots[needs_expand]] = True
+        if dirichlet_eps > 0 and dirichlet_alpha > 0:
+            noise = torch.distributions.Dirichlet(
+                torch.full((4,), dirichlet_alpha, device=device)
+            ).sample((active_roots.shape[0],))
+            child_prior[active_roots] = child_prior[active_roots] * (1.0 - dirichlet_eps) + noise * dirichlet_eps
 
     dx = torch.tensor([0, 0, -1, 1], dtype=torch.int16, device=device)
     dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
