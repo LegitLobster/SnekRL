@@ -571,7 +571,7 @@ def main():
         elif death_type == "self":
             death_self_window += 1
 
-        if not log_ready and len(replay) >= args.replay_size:
+        if not log_ready and len(replay) >= args.replay_warmup:
             log_ready = True
             last_log = global_step
             last_eval = global_step
