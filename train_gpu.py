@@ -348,6 +348,9 @@ def main():
     global_step = start_step
     last_best_time = start_time
     last_best_len = 0
+    last_log_time = None
+    last_log_steps = start_step
+    log_ready = False
     solved_streak = 0
     target_solve_len = args.solve_min_max_len if args.solve_min_max_len > 0 else args.grid * args.grid
     required_solve_evals = max(1, int(args.solve_evals))
@@ -399,6 +402,13 @@ def main():
         global_step += args.n_envs
         death_steps_window += args.n_envs
 
+        if not log_ready and buffer.size >= args.buffer_size:
+            log_ready = True
+            last_log = global_step
+            last_eval = global_step
+            last_log_steps = global_step
+            last_log_time = time.time()
+
         if buffer.size >= args.learning_starts and (global_step % args.train_every == 0):
             for _ in range(args.gradient_steps):
                 b_obs, b_act, b_rew, b_next, b_done = buffer.sample(args.batch_size)
@@ -427,7 +437,7 @@ def main():
             target.load_state_dict(qnet.state_dict())
 
         training_started = buffer.size >= args.learning_starts
-        if training_started and (global_step - last_eval >= args.eval_interval):
+        if log_ready and training_started and (global_step - last_eval >= args.eval_interval):
             try:
                 max_len, mean_eval_reward = eval_policy(
                     qnet,
@@ -467,10 +477,15 @@ def main():
                 _log_error(error_log, f"save_checkpoint failed: {exc}")
             last_ckpt = global_step
 
-        if training_started and (global_step - last_log >= args.log_interval):
+        if log_ready and training_started and (global_step - last_log >= args.log_interval):
             now = time.time()
             runtime_sec = now - start_time
-            fps = global_step / max(1e-6, runtime_sec)
+            if last_log_time is None:
+                last_log_time = now
+                last_log_steps = global_step
+            dt = max(1e-6, now - last_log_time)
+            dsteps = global_step - last_log_steps
+            fps = dsteps / dt
 
             count = int(ep_count.item())
             if count > 0:
@@ -524,6 +539,8 @@ def main():
             ep_max_len_sum.zero_()
             ep_count.zero_()
             last_log = global_step
+            last_log_time = now
+            last_log_steps = global_step
 
             if stop_path is not None:
                 try:
