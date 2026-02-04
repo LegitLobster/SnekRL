@@ -31,6 +31,30 @@ class QNet(nn.Module):
         return self.out(x)
 
 
+class QNetLarge(nn.Module):
+    def __init__(self, in_ch: int, h: int, w: int, n_actions: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.fc = nn.Linear(128 * h * w, 512)
+        self.out = nn.Linear(512, n_actions)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.flatten(1)
+        x = F.relu(self.fc(x))
+        return self.out(x)
+
+
+def build_qnet(model_size: str, in_ch: int, h: int, w: int, n_actions: int):
+    if model_size == "large":
+        return QNetLarge(in_ch, h, w, n_actions)
+    return QNet(in_ch, h, w, n_actions)
+
+
 class ReplayBufferGPU:
     def __init__(self, capacity: int, obs_shape, device: torch.device):
         self.capacity = int(capacity)
@@ -195,6 +219,7 @@ def main():
     parser.add_argument("--eps-end", type=float, default=0.05)
     parser.add_argument("--eps-decay-steps", type=int, default=250_000)
     parser.add_argument("--double-q", action="store_true")
+    parser.add_argument("--model-size", type=str, default="base", choices=["base", "large"])
     parser.add_argument("--eval-interval", type=int, default=20_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-max-steps", type=int, default=1_000)
@@ -237,14 +262,15 @@ def main():
     obs_shape = obs.shape[1:]
     n_actions = 4
 
-    qnet = QNet(obs_shape[0], obs_shape[1], obs_shape[2], n_actions).to(device)
-    target = QNet(obs_shape[0], obs_shape[1], obs_shape[2], n_actions).to(device)
+    qnet = build_qnet(args.model_size, obs_shape[0], obs_shape[1], obs_shape[2], n_actions).to(device)
+    target = build_qnet(args.model_size, obs_shape[0], obs_shape[1], obs_shape[2], n_actions).to(device)
     target.load_state_dict(qnet.state_dict())
     optimizer = torch.optim.Adam(qnet.parameters(), lr=args.lr)
 
     buffer = ReplayBufferGPU(args.buffer_size, obs_shape, device)
 
     out_dir = Path("rl_out")
+    ckpt_suffix = "" if args.model_size == "base" else f"_{args.model_size}"
     train_log = out_dir / "train_log.csv"
     eval_log = out_dir / "eval_log.csv"
     error_log = out_dir / "error.log"
@@ -275,7 +301,7 @@ def main():
     ensure_csv(eval_log, eval_header, args.clean_logs)
 
     if args.resume:
-        ckpt_path = out_dir / "checkpoint_gpu.pt"
+        ckpt_path = out_dir / f"checkpoint_gpu{ckpt_suffix}.pt"
         if ckpt_path.exists():
             try:
                 ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -472,7 +498,7 @@ def main():
                 "step": global_step,
             }
             try:
-                _save_checkpoint_async(_to_cpu(ckpt), out_dir / "checkpoint_gpu.pt", save_state)
+                _save_checkpoint_async(_to_cpu(ckpt), out_dir / f"checkpoint_gpu{ckpt_suffix}.pt", save_state)
             except Exception as exc:
                 _log_error(error_log, f"save_checkpoint failed: {exc}")
             last_ckpt = global_step
@@ -556,7 +582,7 @@ def main():
         "step": global_step,
     }
     try:
-        _save_checkpoint_async(_to_cpu(ckpt), out_dir / "checkpoint_gpu.pt", save_state)
+        _save_checkpoint_async(_to_cpu(ckpt), out_dir / f"checkpoint_gpu{ckpt_suffix}.pt", save_state)
     except Exception as exc:
         _log_error(error_log, f"final checkpoint failed: {exc}")
 
