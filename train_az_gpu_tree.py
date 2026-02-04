@@ -417,7 +417,7 @@ def legal_mask_from_dir(direction: torch.Tensor) -> torch.Tensor:
     b = direction.shape[0]
     mask = torch.ones((b, 4), dtype=torch.bool, device=direction.device)
     reverse = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=direction.device)
-    rev_action = reverse[direction.to(torch.int64)]
+    rev_action = reverse[direction.to(torch.int64)].to(torch.int64)
     mask[torch.arange(b, device=direction.device), rev_action] = False
     return mask
 
