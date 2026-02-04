@@ -481,7 +481,7 @@ def main():
                 "step": global_step,
             }
             try:
-            _save_checkpoint_async(_to_cpu(ckpt), out_dir / f"checkpoint{ckpt_suffix}.pt", save_state)
+                _save_checkpoint_async(_to_cpu(ckpt), out_dir / f"checkpoint{ckpt_suffix}.pt", save_state)
             except Exception as exc:
                 _log_error(error_log, f"save_checkpoint failed: {exc}")
             last_ckpt = global_step
