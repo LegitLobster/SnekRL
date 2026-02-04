@@ -592,6 +592,10 @@ def mcts_search_batch(
     max_nodes_per_root: int,
     max_depth: int,
     workspace: Optional[MCTSWorkspace] = None,
+    roots: Optional[torch.Tensor] = None,
+    next_free: Optional[torch.Tensor] = None,
+    reuse_tree: bool = False,
+    active_mask: Optional[torch.Tensor] = None,
 ):
     batch = root_state["body_age"].shape[0]
     if workspace is None or batch > workspace.max_batch or max_nodes_per_root > workspace.max_nodes_per_root or max_depth > workspace.max_depth:
@@ -609,13 +613,6 @@ def mcts_search_batch(
     node_expanded = workspace.node_expanded[:total_nodes]
     node_terminal = workspace.node_terminal[:total_nodes]
 
-    child_index.fill_(-1)
-    child_prior.zero_()
-    node_visit.zero_()
-    node_value_sum.zero_()
-    node_expanded.zero_()
-    node_terminal.zero_()
-
     body_age = workspace.body_age[:total_nodes]
     length = workspace.length[:total_nodes]
     head_x = workspace.head_x[:total_nodes]
@@ -626,20 +623,29 @@ def mcts_search_batch(
     steps_since_food = workspace.steps_since_food[:total_nodes]
     rng_state = workspace.rng_state[:total_nodes]
 
-    body_age.fill_(-1)
-    length.zero_()
-    head_x.zero_()
-    head_y.zero_()
-    direction.zero_()
-    food_x.zero_()
-    food_y.zero_()
-    steps_since_food.zero_()
-    rng_state.zero_()
+    if not reuse_tree:
+        child_index.fill_(-1)
+        child_prior.zero_()
+        node_visit.zero_()
+        node_value_sum.zero_()
+        node_expanded.zero_()
+        node_terminal.zero_()
 
-    if workspace.max_nodes_per_root == max_nodes_per_root:
-        roots = workspace.root_offsets[:batch]
-    else:
-        roots = torch.arange(batch, device=device, dtype=torch.int64) * max_nodes_per_root
+        body_age.fill_(-1)
+        length.zero_()
+        head_x.zero_()
+        head_y.zero_()
+        direction.zero_()
+        food_x.zero_()
+        food_y.zero_()
+        steps_since_food.zero_()
+        rng_state.zero_()
+
+    if roots is None:
+        if workspace.max_nodes_per_root == max_nodes_per_root:
+            roots = workspace.root_offsets[:batch]
+        else:
+            roots = torch.arange(batch, device=device, dtype=torch.int64) * max_nodes_per_root
 
     body_age[roots] = root_state["body_age"]
     length[roots] = root_state["length"]
@@ -655,9 +661,15 @@ def mcts_search_batch(
 
     obs_root = build_obs(body_age[roots], food_x[roots], food_y[roots], wall_mask)
     legal_mask = legal_mask_from_dir(direction[roots], workspace.legal_mask_table)
-    root_priors, _root_values = policy_value_batch(model, obs_root, legal_mask)
-    child_prior[roots] = root_priors
-    node_expanded[roots] = True
+    needs_expand = ~node_expanded[roots]
+    if active_mask is not None:
+        needs_expand = needs_expand & active_mask
+    if bool(needs_expand.any().item()):
+        root_priors, _root_values = policy_value_batch(model, obs_root[needs_expand], legal_mask[needs_expand])
+        child_prior[roots[needs_expand]] = root_priors
+        node_expanded[roots[needs_expand]] = True
+    else:
+        root_priors = child_prior[roots]
     if dirichlet_eps > 0 and dirichlet_alpha > 0:
         noise = torch.distributions.Dirichlet(torch.full((4,), dirichlet_alpha, device=device)).sample((batch,))
         child_prior[roots] = child_prior[roots] * (1.0 - dirichlet_eps) + noise * dirichlet_eps
@@ -666,7 +678,8 @@ def mcts_search_batch(
     dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
     opposite = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=device)
 
-    next_free = roots + 1
+    if next_free is None:
+        next_free = roots + 1
 
     for _ in range(sims):
         cur_nodes = workspace.cur_nodes[:batch]
@@ -674,7 +687,10 @@ def mcts_search_batch(
         values = workspace.values[:batch]
         values.zero_()
         done_mask = workspace.done_mask[:batch]
-        done_mask.zero_()
+        if active_mask is None:
+            done_mask.zero_()
+        else:
+            done_mask.copy_(~active_mask)
         path_nodes = workspace.path_nodes[:batch, :max_depth]
         path_nodes.fill_(-1)
 
@@ -855,6 +871,10 @@ def self_play_batch_gpu(
     dy = workspace.dy
     opposite = workspace.opposite
 
+    roots = workspace.root_offsets[:batch_size].clone()
+    next_free = roots + 1
+    reuse_tree = False
+
     obs_buf = torch.empty(
         (batch_size, max_steps, 4, config.grid_h, config.grid_w), dtype=torch.float32, device=device
     )
@@ -877,9 +897,22 @@ def self_play_batch_gpu(
             "rng_state": state["rng_state"][active_idx],
         }
 
+        # Build a compact root_state for active envs but run MCTS over full batch with mask.
+        full_root_state = {
+            "body_age": state["body_age"],
+            "length": state["length"],
+            "head_x": state["head_x"],
+            "head_y": state["head_y"],
+            "direction": state["direction"],
+            "food_x": state["food_x"],
+            "food_y": state["food_y"],
+            "steps_since_food": state["steps_since_food"],
+            "rng_state": state["rng_state"],
+        }
+
         counts = mcts_search_batch(
             model,
-            root_state,
+            full_root_state,
             config,
             sims,
             c_puct,
@@ -889,12 +922,18 @@ def self_play_batch_gpu(
             max_nodes_per_root,
             max_depth=max_depth,
             workspace=workspace,
+            roots=roots,
+            next_free=next_free,
+            reuse_tree=reuse_tree,
+            active_mask=active,
         )
+        reuse_tree = True
 
-        obs = build_obs(root_state["body_age"], root_state["food_x"], root_state["food_y"], wall_mask)
+        obs = build_obs(state["body_age"][active_idx], state["food_x"][active_idx], state["food_y"][active_idx], wall_mask)
 
-        totals = counts.sum(dim=1, keepdim=True)
-        policy = torch.where(totals > 0, counts / totals, torch.full_like(counts, 0.25))
+        counts_active = counts[active_idx]
+        totals = counts_active.sum(dim=1, keepdim=True)
+        policy = torch.where(totals > 0, counts_active / totals, torch.full_like(counts_active, 0.25))
         temps = torch.where(ep_lengths[active_idx] < temp_threshold, torch.tensor(temperature, device=device), torch.tensor(0.0, device=device))
         temp_mask = temps > 0
         actions = policy.argmax(dim=1)
@@ -929,6 +968,73 @@ def self_play_batch_gpu(
 
         for k in state:
             state[k][active_idx] = next_state[k]
+
+        # Tree reuse: move roots to chosen child, creating it if needed.
+        if active_idx.numel() > 0:
+            root_nodes = roots[active_idx]
+            child_nodes = workspace.child_index[root_nodes, actions.to(torch.int64)]
+            need_child = child_nodes < 0
+            if bool(need_child.any().item()):
+                need_idx = active_idx[need_child]
+                root_nodes_need = root_nodes[need_child]
+                actions_need = actions[need_child].to(torch.int64)
+
+                alloc = next_free[need_idx]
+                limit = workspace.root_offsets[need_idx] + max_nodes_per_root
+                valid = alloc < limit
+
+                if bool(valid.any().item()):
+                    valid_idx = need_idx[valid]
+                    valid_nodes = alloc[valid]
+                    workspace.child_index[root_nodes_need[valid], actions_need[valid]] = valid_nodes
+
+                    # Fill new node state from next_state (already computed).
+                    workspace.body_age[valid_nodes] = next_state["body_age"][need_child][valid]
+                    workspace.length[valid_nodes] = next_state["length"][need_child][valid]
+                    workspace.head_x[valid_nodes] = next_state["head_x"][need_child][valid]
+                    workspace.head_y[valid_nodes] = next_state["head_y"][need_child][valid]
+                    workspace.direction[valid_nodes] = next_state["direction"][need_child][valid]
+                    workspace.food_x[valid_nodes] = next_state["food_x"][need_child][valid]
+                    workspace.food_y[valid_nodes] = next_state["food_y"][need_child][valid]
+                    workspace.steps_since_food[valid_nodes] = next_state["steps_since_food"][need_child][valid]
+                    workspace.rng_state[valid_nodes] = next_state["rng_state"][need_child][valid]
+
+                    workspace.node_expanded[valid_nodes] = False
+                    workspace.node_terminal[valid_nodes] = done[need_child][valid]
+                    workspace.node_visit[valid_nodes] = 0.0
+                    workspace.node_value_sum[valid_nodes] = 0.0
+                    workspace.child_index[valid_nodes] = -1
+                    workspace.child_prior[valid_nodes] = 0.0
+
+                    next_free[valid_idx] = alloc[valid] + 1
+
+                # If out of nodes, reset tree for those envs.
+                invalid = need_idx[~valid]
+                if invalid.numel() > 0:
+                    start = workspace.root_offsets[invalid]
+                    for s in start.tolist():
+                        e = s + max_nodes_per_root
+                        workspace.child_index[s:e] = -1
+                        workspace.child_prior[s:e] = 0.0
+                        workspace.node_visit[s:e] = 0.0
+                        workspace.node_value_sum[s:e] = 0.0
+                        workspace.node_expanded[s:e] = False
+                        workspace.node_terminal[s:e] = False
+                        workspace.body_age[s:e] = -1
+                        workspace.length[s:e] = 0
+                        workspace.head_x[s:e] = 0
+                        workspace.head_y[s:e] = 0
+                        workspace.direction[s:e] = 0
+                        workspace.food_x[s:e] = 0
+                        workspace.food_y[s:e] = 0
+                        workspace.steps_since_food[s:e] = 0
+                        workspace.rng_state[s:e] = 0
+                    roots[invalid] = start
+                    next_free[invalid] = start + 1
+
+                child_nodes = workspace.child_index[root_nodes, actions.to(torch.int64)]
+
+            roots[active_idx] = child_nodes
 
         if status_hook is not None and steps_since_status >= status_interval:
             if active_idx.numel() > 0:
