@@ -99,9 +99,9 @@ def make_mcts_workspace(
     wall_mask[:, 0] = 1.0
     wall_mask[:, grid_w - 1] = 1.0
 
-    dx = workspace.dx
-    dy = workspace.dy
-    opposite = workspace.opposite
+    dx = torch.tensor([0, 0, -1, 1], dtype=torch.int16, device=device)
+    dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
+    opposite = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=device)
 
     legal_mask_table = torch.ones((4, 4), dtype=torch.bool, device=device)
     reverse = torch.tensor([1, 0, 3, 2], dtype=torch.int64, device=device)
