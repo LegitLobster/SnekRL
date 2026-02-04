@@ -309,6 +309,8 @@ def self_play_episode(
     rng: np.random.Generator,
     seed: int,
     max_steps: int,
+    status_hook=None,
+    status_interval: int = 10,
 ):
     state = SnekState.new(config, seed=seed)
     episode = []
@@ -316,6 +318,7 @@ def self_play_episode(
     ep_len = 0
     ep_max_len = state.length
     death_type = None
+    last_status_step = 0
 
     done = False
     while not done and ep_len < max_steps:
@@ -345,6 +348,9 @@ def self_play_episode(
         ep_max_len = max(ep_max_len, int(info.get("length", state.length)))
         if done:
             death_type = info.get("death")
+        if status_hook is not None and (ep_len - last_status_step) >= status_interval:
+            status_hook(ep_len, ep_reward, ep_max_len)
+            last_status_step = ep_len
 
     outcome = outcome_value(state)
     examples = [(obs, policy, outcome) for obs, policy in episode]
@@ -570,6 +576,15 @@ def main():
     }
     status_lock = threading.Lock()
 
+    def status_update(ep_len: int, ep_reward: float, ep_max_len: int):
+        with status_lock:
+            status_state["steps"] = global_step + ep_len
+            status_state["replay"] = len(replay)
+            status_state["training_started"] = len(replay) >= args.replay_warmup
+            status_state["last_ep_len"] = ep_len
+            status_state["last_ep_reward"] = ep_reward
+            status_state["last_ep_max_len"] = ep_max_len
+
     def heartbeat_worker():
         while True:
             time.sleep(10.0)
@@ -596,6 +611,8 @@ def main():
             np_rng,
             seed,
             args.max_episode_steps,
+            status_hook=status_update,
+            status_interval=10,
         )
 
         if ep_len <= 0:
