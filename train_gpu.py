@@ -337,7 +337,7 @@ def main():
     ep_reward_sum = torch.zeros((), dtype=torch.float32, device=device)
     ep_len_sum = torch.zeros((), dtype=torch.float32, device=device)
     ep_max_len_sum = torch.zeros((), dtype=torch.float32, device=device)
-    ep_count = torch.zeros((), dtype=torch.int32, device=device)
+    ep_count = torch.zeros((), dtype=torch.float32, device=device)
     best_train_max_len_t = torch.zeros((), dtype=torch.int32, device=device)
 
     start_time = time.time()
@@ -378,25 +378,20 @@ def main():
         done_mask = done.to(torch.bool)
         death_wall_window_t += info["death_wall"].to(torch.int32).sum()
         death_self_window_t += info["death_self"].to(torch.int32).sum()
-        if done_mask.any():
-            done_idx = torch.where(done_mask)[0]
-            if done_idx.numel() > 0:
-                done_rewards = cur_ep_rewards[done_idx]
-                done_lengths = cur_ep_lengths[done_idx].to(torch.float32)
-                done_max_lens = cur_ep_max_len[done_idx].to(torch.float32)
-                ep_reward_sum += done_rewards.sum()
-                ep_len_sum += done_lengths.sum()
-                ep_max_len_sum += done_max_lens.sum()
-                ep_count += done_idx.numel()
-                best_train_max_len_t = torch.maximum(best_train_max_len_t, cur_ep_max_len[done_idx].max())
 
-                cur_ep_rewards[done_idx] = 0.0
-                cur_ep_lengths[done_idx] = 0
-                cur_ep_max_len[done_idx] = 0
+        done_f = done_mask.to(torch.float32)
+        ep_reward_sum += (cur_ep_rewards * done_f).sum()
+        ep_len_sum += (cur_ep_lengths.to(torch.float32) * done_f).sum()
+        ep_max_len_sum += (cur_ep_max_len.to(torch.float32) * done_f).sum()
+        ep_count += done_f.sum()
+        best_train_max_len_t = torch.maximum(
+            best_train_max_len_t,
+            torch.where(done_mask, cur_ep_max_len, torch.zeros_like(cur_ep_max_len)).max(),
+        )
 
-                reset_obs = env.reset_done(done_mask)
-                if reset_obs is not None:
-                    next_obs[done_idx] = reset_obs
+        cur_ep_rewards = torch.where(done_mask, torch.zeros_like(cur_ep_rewards), cur_ep_rewards)
+        cur_ep_lengths = torch.where(done_mask, torch.zeros_like(cur_ep_lengths), cur_ep_lengths)
+        cur_ep_max_len = torch.where(done_mask, torch.zeros_like(cur_ep_max_len), cur_ep_max_len)
 
         buffer.add_batch(obs, actions, rewards, next_obs, done_mask.to(torch.float32))
         obs = next_obs
