@@ -2,8 +2,10 @@ import argparse
 import csv
 import math
 import random
+import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -637,6 +639,11 @@ def main():
     error_log = out_dir / "error.log"
     status_log = out_dir / "status.log"
     stop_path = Path(args.stop_file) if args.stop_file else None
+
+    def _excepthook(exc_type, exc, tb):
+        _log_error(error_log, "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    sys.excepthook = _excepthook
 
     train_header = [
         "steps",
