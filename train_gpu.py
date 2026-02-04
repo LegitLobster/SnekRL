@@ -194,6 +194,7 @@ def main():
     parser.add_argument("--eps-start", type=float, default=1.0)
     parser.add_argument("--eps-end", type=float, default=0.05)
     parser.add_argument("--eps-decay-steps", type=int, default=250_000)
+    parser.add_argument("--double-q", action="store_true")
     parser.add_argument("--eval-interval", type=int, default=20_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--eval-max-steps", type=int, default=1_000)
@@ -404,7 +405,11 @@ def main():
                 with amp_ctx:
                     q_values = qnet(b_obs).gather(1, b_act.unsqueeze(1)).squeeze(1)
                     with torch.no_grad():
-                        next_q = target(b_next).max(1)[0]
+                        if args.double_q:
+                            next_actions = qnet(b_next).argmax(dim=1)
+                            next_q = target(b_next).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                        else:
+                            next_q = target(b_next).max(1)[0]
                         target_q = b_rew + args.gamma * (1.0 - b_done) * next_q
                     loss = F.smooth_l1_loss(q_values, target_q)
                 optimizer.zero_grad()
