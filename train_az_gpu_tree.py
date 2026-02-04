@@ -567,7 +567,8 @@ def select_puct(
     priors = child_prior[idx]
     legal_mask = legal_mask_from_dir(direction[idx], legal_mask_table)
 
-    child_idx_clamped = torch.clamp(child_idx, min=0)
+    max_idx = node_visit.shape[0] - 1
+    child_idx_clamped = torch.clamp(child_idx, min=0, max=max_idx)
     child_visits = node_visit[child_idx_clamped]
     child_values = torch.zeros_like(child_visits, dtype=torch.float32)
     nonzero = child_visits > 0
@@ -752,7 +753,7 @@ def mcts_search_batch(
                 root_ids = (parent_nodes // max_nodes_per_root).to(torch.int64)
                 alloc = next_free[root_ids]
                 limit = roots[root_ids] + max_nodes_per_root
-                valid = alloc < limit
+                valid = (alloc < limit) & (alloc < total_nodes)
                 new_nodes = torch.where(valid, alloc, torch.full_like(alloc, -1))
                 next_free[root_ids] = torch.where(valid, alloc + 1, alloc)
 
@@ -829,7 +830,7 @@ def mcts_search_batch(
 
     counts = torch.zeros((batch, 4), dtype=torch.float32, device=device)
     root_children = child_index[roots]
-    child_visits = node_visit[torch.clamp(root_children, min=0)]
+    child_visits = node_visit[torch.clamp(root_children, min=0, max=total_nodes - 1)]
     counts = torch.where(root_children >= 0, child_visits, counts)
     return counts
 
