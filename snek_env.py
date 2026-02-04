@@ -28,11 +28,11 @@ class SnekEnv(gym.Env):
         self.render_mode = render_mode
 
         self.action_space = gym.spaces.Discrete(4)
-        # Channels-first: 3 x H x W
+        # Channels-first: 4 x H x W (body, head, food, walls)
         self.observation_space = gym.spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(3, self.config.grid_h, self.config.grid_w),
+            shape=(4, self.config.grid_h, self.config.grid_w),
             dtype=np.float32,
         )
 
@@ -89,6 +89,8 @@ class SnekEnv(gym.Env):
             self._food = self._random_food()
         self._steps_since_food = 0
         self._score = max(0, len(self._snake) - 3)
+        self.last_wall = False
+        self.last_self = False
 
         return self._get_obs(), {}
 
@@ -115,13 +117,16 @@ class SnekEnv(gym.Env):
         grid_cells = self.config.grid_w * self.config.grid_h
         reward = -1.0 / max(1, grid_cells)
 
-        if (
+        hit_wall = (
             new_head[0] < 0
             or new_head[0] >= self.config.grid_w
             or new_head[1] < 0
             or new_head[1] >= self.config.grid_h
-            or new_head in self._snake
-        ):
+        )
+        hit_self = (new_head in self._snake)
+        self.last_wall = bool(hit_wall)
+        self.last_self = bool(hit_self)
+        if hit_wall or hit_self:
             terminated = True
             reward = self.config.death_penalty
             if self.config.zero_out_on_death and self._score > 0:
@@ -152,6 +157,11 @@ class SnekEnv(gym.Env):
         obs = self._get_obs()
 
         info = {"length": len(self._snake)}
+        if terminated:
+            if hit_wall:
+                info["death"] = "wall"
+            elif hit_self:
+                info["death"] = "self"
         return obs, reward, terminated, truncated, info
 
     def _is_reachable(self, target):
@@ -179,7 +189,7 @@ class SnekEnv(gym.Env):
 
     def _get_obs(self):
         h, w = self.config.grid_h, self.config.grid_w
-        obs = np.zeros((3, h, w), dtype=np.float32)
+        obs = np.zeros((4, h, w), dtype=np.float32)
 
         for (x, y) in self._snake[1:]:
             if 0 <= x < w and 0 <= y < h:
@@ -193,6 +203,12 @@ class SnekEnv(gym.Env):
         if 0 <= food_x < w and 0 <= food_y < h:
             obs[2, food_y, food_x] = 1.0
 
+        # Explicit wall channel (board boundary).
+        obs[3, 0, :] = 1.0
+        obs[3, h - 1, :] = 1.0
+        obs[3, :, 0] = 1.0
+        obs[3, :, w - 1] = 1.0
+
         return obs
 
     def render(self):
@@ -201,7 +217,14 @@ class SnekEnv(gym.Env):
 
         cell = 16
         h, w = self.config.grid_h, self.config.grid_w
-        img = np.zeros((h * cell, w * cell, 3), dtype=np.uint8)
+        shape = (h * cell, w * cell, 3)
+        img = getattr(self, "_render_buf", None)
+        if img is None or img.shape != shape or img.dtype != np.uint8:
+            try:
+                img = np.zeros(shape, dtype=np.uint8)
+            except MemoryError:
+                return None
+            self._render_buf = img
 
         # Background
         img[:] = (14, 20, 24)

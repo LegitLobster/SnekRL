@@ -1,5 +1,5 @@
 param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
-$gitdir = Join-Path $env:TEMP 'SnekRL.git'
+$gitdir = 'C:\vscode\snekRL_gitdir'
 $work = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not (Test-Path $gitdir)) {
   Write-Error "Git dir not found: $gitdir"

@@ -21,8 +21,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", type=str, default="rl_out/train_log.csv")
     parser.add_argument("--eval", type=str, default="rl_out/eval_log.csv")
-    parser.add_argument("--refresh-ms", type=int, default=16)
+    parser.add_argument("--refresh-ms", type=int, default=1000)
     parser.add_argument("--stream-max-rows", type=int, default=5)
+    parser.add_argument("--no-stream", action="store_true")
     parser.add_argument("--use-opengl", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--series-len", type=int, default=0)
     parser.add_argument("--display-max-points", type=int, default=0)
@@ -72,15 +73,17 @@ def main():
 
     stop_btn.clicked.connect(on_stop)
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-    server.bind(("127.0.0.1", args.stream_port))
-    server.listen(1)
-    server.setblocking(False)
+    server = None
     connections = []
     buffers = {}
     stream_rows = []
+    if not args.no_stream:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        server.bind(("127.0.0.1", args.stream_port))
+        server.listen(1)
+        server.setblocking(False)
     series_len = args.series_len
     if series_len and series_len > 0:
         def _series():
@@ -94,10 +97,6 @@ def main():
         "mean_reward": _series(),
         "mean_len": _series(),
         "mean_max_len": _series(),
-        "mean_reward_long": _series(),
-        "mean_len_long": _series(),
-        "mean_max_len_long": _series(),
-        "mean_loss_long": _series(),
         "loss": _series(),
         "fps": _series(),
         "eps": _series(),
@@ -107,6 +106,8 @@ def main():
         "runtime_sec": _series(),
         "best_train_rate_per_min": _series(),
         "best_eval_rate_per_min": _series(),
+        "death_wall_per_k": _series(),
+        "death_self_per_k": _series(),
     }
     cached_log_rows = []
     last_csv_read = 0
@@ -116,6 +117,8 @@ def main():
     total_stream_rows = 0
 
     def accept_new():
+        if server is None:
+            return
         try:
             conn, _addr = server.accept()
             conn.setblocking(False)
@@ -125,6 +128,8 @@ def main():
             pass
 
     def read_stream():
+        if server is None:
+            return
         for conn in list(connections):
             while True:
                 try:
@@ -153,10 +158,7 @@ def main():
 
     colors = {
         "regular": (31, 119, 180),
-        "long_start": (255, 127, 14),
-        "long": (255, 127, 14),
         "loss": (31, 119, 180),
-        "loss_long": (255, 127, 14),
         "fps": (31, 119, 180),
         "eps": (31, 119, 180),
         "eval": (31, 119, 180),
@@ -164,6 +166,8 @@ def main():
         "best_eval": (255, 127, 14),
         "board": (31, 119, 180),
         "runtime": (31, 119, 180),
+        "death_wall": (214, 39, 40),
+        "death_self": (148, 103, 189),
     }
 
     def pen_for(label):
@@ -171,17 +175,17 @@ def main():
         return pg.mkPen(color=color, width=2)
 
     plot_defs = {
-        0: [("regular", "Train mean reward"), ("long_start", "Train mean reward")],
-        1: [("regular", "Train episode duration (steps)"), ("long_start", "Train episode duration (steps)")],
-        2: [("regular", "Train mean max snake length (exploring)"), ("long", "Train mean max snake length (exploring)")],
-        3: [("loss", "Loss"), ("loss_long", "Loss")],
+        0: [("regular", "Train mean reward")],
+        1: [("regular", "Train episode duration (steps)")],
+        2: [("regular", "Train mean max snake length (exploring)")],
+        3: [("loss", "Loss")],
         4: [("fps", "FPS")],
         5: [("eps", "Epsilon")],
         6: [("eval", "Eval max snake length (greedy)")],
         7: [("eval", "Eval mean reward (greedy)")],
         8: [("best_train", "Best max snake length (train vs eval)"), ("best_eval", "Best max snake length (train vs eval)")],
         9: [("board", "Board size")],
-        10: [("runtime", "Runtime (min)")],
+        10: [("death_wall", "Death rate (per 1k)"), ("death_self", "Death rate (per 1k)")],
         11: [("best_train", "Best max len ?/min"), ("best_eval", "Best max len ?/min")],
     }
 
@@ -227,13 +231,10 @@ def main():
             "mean_reward": to_float(row.get("mean_reward")),
             "mean_len": to_float(row.get("mean_len")),
             "mean_max_len": to_float(row.get("mean_max_len")),
-            "mean_reward_long": to_float(row.get("mean_reward_long")),
-            "mean_len_long": to_float(row.get("mean_len_long")),
-            "mean_max_len_long": to_float(row.get("mean_max_len_long")),
-            "mean_loss_long": to_float(row.get("mean_loss_long"), 0.0),
             "loss": to_float(row.get("loss"), 0.0),
-            "fps": to_float(row.get("fps"), 0.0),
             "eps": to_float(row.get("eps"), 0.0),
+            "death_wall_per_k": to_float(row.get("death_wall_per_k"), 0.0),
+            "death_self_per_k": to_float(row.get("death_self_per_k"), 0.0),
         }
         for k, v in raw.items():
             append_value(k, v)
@@ -245,6 +246,7 @@ def main():
             training_started = training_started.strip().lower() in ("1", "true", "yes", "y")
         training_started = bool(training_started)
         if training_started:
+            append_value("fps", to_float(row.get("fps"), 0.0))
             bt = to_float(row.get("best_train_rate_per_min"), 0.0)
             be = to_float(row.get("best_eval_rate_per_min"), 0.0)
             append_value("best_train_rate_per_min", bt)
@@ -263,8 +265,9 @@ def main():
 
     def update():
         nonlocal last_eval_read, last_csv_read, cached_log_rows, last_stream_time, using_stream, total_stream_rows, last_data_time, frame_idx
-        accept_new()
-        read_stream()
+        if not args.no_stream:
+            accept_new()
+            read_stream()
 
         if stream_rows:
             total_stream_rows += len(stream_rows)
@@ -303,13 +306,9 @@ def main():
         if steps_all:
             steps = steps_all
             mean_reward = list(series["mean_reward"])
-            mean_reward_long = list(series["mean_reward_long"])
             mean_len = list(series["mean_len"])
-            mean_len_long = list(series["mean_len_long"])
             mean_max_len = list(series["mean_max_len"])
-            mean_max_len_long = list(series["mean_max_len_long"])
             loss = list(series["loss"])
-            mean_loss_long = list(series["mean_loss_long"])
             fps = list(series["fps"])
             eps = list(series["eps"])
             best_train_max_len = list(series["best_train_max_len"])
@@ -318,29 +317,20 @@ def main():
             runtime_sec = list(series["runtime_sec"])
             best_train_rate = list(series["best_train_rate_per_min"])
             best_eval_rate = list(series["best_eval_rate_per_min"])
+            death_wall_per_k = list(series["death_wall_per_k"])
+            death_self_per_k = list(series["death_self_per_k"])
 
             x0, y0 = downsample(steps[: len(mean_reward)], mean_reward)
             set_curve(curves[(0, "regular")], x0, y0)
-            if mean_reward_long:
-                x1, y1 = downsample(steps[: len(mean_reward_long)], mean_reward_long)
-                set_curve(curves[(0, "long_start")], x1, y1)
             x2, y2 = downsample(steps[: len(mean_len)], mean_len)
             set_curve(curves[(1, "regular")], x2, y2)
-            if mean_len_long:
-                x3, y3 = downsample(steps[: len(mean_len_long)], mean_len_long)
-                set_curve(curves[(1, "long_start")], x3, y3)
             x4, y4 = downsample(steps[: len(mean_max_len)], mean_max_len)
             set_curve(curves[(2, "regular")], x4, y4)
-            if mean_max_len_long:
-                x5, y5 = downsample(steps[: len(mean_max_len_long)], mean_max_len_long)
-                set_curve(curves[(2, "long")], x5, y5)
 
             x6, y6 = downsample(steps[: len(loss)], loss)
             set_curve(curves[(3, "loss")], x6, y6)
-            if mean_loss_long:
-                x7, y7 = downsample(steps[: len(mean_loss_long)], mean_loss_long)
-                set_curve(curves[(3, "loss_long")], x7, y7)
-            x8, y8 = downsample(steps[: len(fps)], fps)
+            fps_steps = steps[-len(fps):] if fps else []
+            x8, y8 = downsample(fps_steps, fps)
             set_curve(curves[(4, "fps")], x8, y8)
             x9, y9 = downsample(steps[: len(eps)], eps)
             set_curve(curves[(5, "eps")], x9, y9)
@@ -361,15 +351,16 @@ def main():
             x14, y14 = downsample(steps[: len(board_size)], board_size)
             set_curve(curves[(9, "board")], x14, y14)
 
-            runtime_min = [v / 60.0 for v in runtime_sec]
-            x15, y15 = downsample(steps[: len(runtime_min)], runtime_min)
-            set_curve(curves[(10, "runtime")], x15, y15)
+            x15, y15 = downsample(steps[: len(death_wall_per_k)], death_wall_per_k)
+            set_curve(curves[(10, "death_wall")], x15, y15)
+            x16, y16 = downsample(steps[: len(death_self_per_k)], death_self_per_k)
+            set_curve(curves[(10, "death_self")], x16, y16)
             rate_steps = steps[-len(best_train_rate) :] if best_train_rate else []
-            x16, y16 = downsample(rate_steps, best_train_rate)
-            set_curve(curves[(11, "best_train")], x16, y16)
+            x17, y17 = downsample(rate_steps, best_train_rate)
+            set_curve(curves[(11, "best_train")], x17, y17)
             rate_steps_eval = steps[-len(best_eval_rate) :] if best_eval_rate else []
-            x17, y17 = downsample(rate_steps_eval, best_eval_rate)
-            set_curve(curves[(11, "best_eval")], x17, y17)
+            x18, y18 = downsample(rate_steps_eval, best_eval_rate)
+            set_curve(curves[(11, "best_eval")], x18, y18)
 
             if runtime_sec:
                 total = int(runtime_sec[-1])
@@ -387,8 +378,9 @@ def main():
 
         now_ms = QtCore.QTime.currentTime().msecsSinceStartOfDay()
         age = now_ms - last_stream_time if last_stream_time else -1
+        stream_status = "disabled" if args.no_stream else f"{total_stream_rows} | last stream age ms: {age} | conns: {len(connections)}"
         status_label.setText(
-            f"Stream rows: {total_stream_rows} | last stream age ms: {age} | conns: {len(connections)}"
+            f"Stream rows: {stream_status}"
             f" | points: {len(series['steps'])} | maxPts={args.display_max_points}"
             f" | opengl={args.use_opengl}"
         )

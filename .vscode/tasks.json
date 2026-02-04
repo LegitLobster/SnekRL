@@ -1,0 +1,66 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Snek RL: Train (single) + Live Plot",
+      "type": "shell",
+      "command": "c:\\vscode\\snek\\.venv\\Scripts\\python.exe",
+      "args": [
+        "c:\\vscode\\snek\\train_rl.py",
+        "--live-plot",
+        "--timesteps",
+        "2000000",
+        "--n-envs",
+        "64",
+        "--batch-size",
+        "8192",
+        "--gradient-steps",
+        "8",
+        "--buffer-size",
+        "500000",
+        "--learning-starts",
+        "100000",
+        "--train-every",
+        "2",
+        "--target-update",
+        "5000",
+        "--device",
+        "cuda"
+      ],
+      "options": {
+        "cwd": "c:\\vscode\\snek"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Snek RL: Dual Train + Live Plot",
+      "type": "shell",
+      "command": "c:\\vscode\\snek\\.venv\\Scripts\\python.exe",
+      "args": [
+        "c:\\vscode\\snek\\dual_train.py",
+        "--timesteps",
+        "2000000",
+        "--n-envs",
+        "64",
+        "--batch-size",
+        "8192",
+        "--gradient-steps",
+        "8",
+        "--buffer-size",
+        "500000",
+        "--learning-starts",
+        "100000",
+        "--train-every",
+        "2",
+        "--target-update",
+        "5000",
+        "--device",
+        "cuda"
+      ],
+      "options": {
+        "cwd": "c:\\vscode\\snek"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

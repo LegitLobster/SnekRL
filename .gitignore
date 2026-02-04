@@ -18,7 +18,10 @@ rl_out/
 *.gif
 
 # Editor / OS
-.vscode/
 .idea/
 *.swp
 .DS_Store
+
+# Allow launch presets to be tracked.
+!.vscode/
+!.vscode/launch.json
