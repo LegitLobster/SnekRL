@@ -430,6 +430,7 @@ def main():
     train_log = out_dir / "train_log.csv"
     eval_log = out_dir / "eval_log.csv"
     error_log = out_dir / "error.log"
+    status_log = out_dir / "status.log"
     stop_path = Path(args.stop_file) if args.stop_file else None
 
     train_header = [
@@ -455,6 +456,11 @@ def main():
 
     ensure_csv(train_log, train_header, args.clean_logs)
     ensure_csv(eval_log, eval_header, args.clean_logs)
+    if args.clean_logs and status_log.exists():
+        try:
+            status_log.unlink()
+        except OSError:
+            pass
 
     start_step = 0
     best_eval_max_len = 0
@@ -526,6 +532,7 @@ def main():
     last_log_time = None
     last_log_steps = start_step
     log_ready = False
+    last_status_time = 0.0
     solved_streak = 0
     target_solve_len = args.solve_min_max_len if args.solve_min_max_len > 0 else args.grid * args.grid
     required_solve_evals = max(1, int(args.solve_evals))
@@ -571,6 +578,22 @@ def main():
         elif death_type == "self":
             death_self_window += 1
 
+        training_started = len(replay) >= args.replay_warmup
+        now = time.time()
+        if now - last_status_time >= 10.0:
+            try:
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                status_log.parent.mkdir(parents=True, exist_ok=True)
+                with status_log.open("a", encoding="ascii") as f:
+                    f.write(
+                        f"{ts} steps={global_step} replay={len(replay)} "
+                        f"training_started={training_started} last_ep_len={ep_len} "
+                        f"last_ep_reward={ep_reward:.3f} last_ep_max_len={ep_max_len}\n"
+                    )
+            except Exception:
+                pass
+            last_status_time = now
+
         if not log_ready and len(replay) >= args.replay_warmup:
             log_ready = True
             last_log = global_step
@@ -578,7 +601,6 @@ def main():
             last_log_steps = global_step
             last_log_time = time.time()
 
-        training_started = len(replay) >= args.replay_warmup
         loss_val = 0.0
         if training_started:
             model.train()
