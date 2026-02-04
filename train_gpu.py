@@ -3,6 +3,7 @@ import csv
 import math
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
 
@@ -149,7 +150,8 @@ def write_row(path: Path, row: dict, header: List[str], error_log: Optional[Path
             _log_error(error_log, f"write_row failed for {path}: {exc}")
 
 
-def eval_policy(qnet, device, env, episodes, max_steps):
+def eval_policy(qnet, env, episodes, max_steps, amp_ctx):
+    device = env.device
     qnet.eval()
     total_reward = 0.0
     max_len = 0
@@ -161,7 +163,8 @@ def eval_policy(qnet, device, env, episodes, max_steps):
         ep_max_len = 0
         while not bool(done.item()) and steps < max_steps:
             with torch.no_grad():
-                q = qnet(obs)
+                with amp_ctx:
+                    q = qnet(obs)
                 action = int(q.argmax(dim=1).item())
             next_obs, reward, done, info = env.step(torch.tensor([action], device=device))
             obs = next_obs
@@ -202,6 +205,8 @@ def main():
     parser.add_argument("--clean-logs", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-interval", type=int, default=50_000)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--tf32", action="store_true")
     parser.add_argument("--live-plot", action="store_true")
     parser.add_argument("--plot-refresh-ms", type=int, default=1000)
     parser.add_argument("--plot-no-stream", action="store_true")
@@ -211,6 +216,19 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        if args.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+    use_amp = device.type == "cuda" and args.amp
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_amp else nullcontext()
+    if use_amp:
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            scaler = torch.amp.GradScaler("cuda")
+        else:
+            scaler = torch.cuda.amp.GradScaler()
+    else:
+        scaler = None
 
     env = SnekEnvGPU(args.n_envs, SnekConfig(grid_w=args.grid, grid_h=args.grid), device)
     eval_env = SnekEnvGPU(1, SnekConfig(grid_w=args.grid, grid_h=args.grid), device)
@@ -344,7 +362,8 @@ def main():
         eps = epsilon_by_step(global_step, args.eps_start, args.eps_end, args.eps_decay_steps)
 
         with torch.no_grad():
-            q = qnet(obs)
+            with amp_ctx:
+                q = qnet(obs)
         greedy_actions = q.argmax(dim=1)
         random_actions = torch.randint(0, n_actions, (args.n_envs,), device=device)
         use_random = torch.rand(args.n_envs, device=device) < eps
@@ -387,14 +406,20 @@ def main():
         if buffer.size >= args.learning_starts and (global_step % args.train_every == 0):
             for _ in range(args.gradient_steps):
                 b_obs, b_act, b_rew, b_next, b_done = buffer.sample(args.batch_size)
-                q_values = qnet(b_obs).gather(1, b_act.unsqueeze(1)).squeeze(1)
-                with torch.no_grad():
-                    next_q = target(b_next).max(1)[0]
-                    target_q = b_rew + args.gamma * (1.0 - b_done) * next_q
-                loss = F.smooth_l1_loss(q_values, target_q)
+                with amp_ctx:
+                    q_values = qnet(b_obs).gather(1, b_act.unsqueeze(1)).squeeze(1)
+                    with torch.no_grad():
+                        next_q = target(b_next).max(1)[0]
+                        target_q = b_rew + args.gamma * (1.0 - b_done) * next_q
+                    loss = F.smooth_l1_loss(q_values, target_q)
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if use_amp and scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
         else:
             loss = torch.tensor(0.0, device=device)
 
@@ -406,10 +431,10 @@ def main():
             try:
                 max_len, mean_eval_reward = eval_policy(
                     qnet,
-                    device,
                     eval_env,
                     args.eval_episodes,
                     args.eval_max_steps,
+                    amp_ctx,
                 )
                 best_eval_max_len = max(best_eval_max_len, int(max_len))
                 write_row(
