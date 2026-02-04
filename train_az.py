@@ -178,6 +178,22 @@ def _save_checkpoint_async(state, path: Path, save_state: dict) -> bool:
     return True
 
 
+def _write_status(status_path: Path, payload: dict):
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        with status_path.open("a", encoding="ascii") as f:
+            f.write(
+                f"{ts} steps={payload.get('steps', 0)} replay={payload.get('replay', 0)} "
+                f"training_started={payload.get('training_started', False)} "
+                f"last_ep_len={payload.get('last_ep_len', 0)} "
+                f"last_ep_reward={payload.get('last_ep_reward', 0.0):.3f} "
+                f"last_ep_max_len={payload.get('last_ep_max_len', 0)}\n"
+            )
+    except Exception:
+        pass
+
+
 def masked_softmax(logits: torch.Tensor, legal_actions: List[int]) -> torch.Tensor:
     mask = torch.full_like(logits, -1e9)
     mask[legal_actions] = 0.0
@@ -544,6 +560,26 @@ def main():
         except OSError as exc:
             _log_error(error_log, f"Failed to remove stop file: {exc}")
 
+    status_state = {
+        "steps": start_step,
+        "replay": 0,
+        "training_started": False,
+        "last_ep_len": 0,
+        "last_ep_reward": 0.0,
+        "last_ep_max_len": 0,
+    }
+    status_lock = threading.Lock()
+
+    def heartbeat_worker():
+        while True:
+            time.sleep(10.0)
+            with status_lock:
+                payload = dict(status_state)
+            _write_status(status_log, payload)
+
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    _write_status(status_log, status_state)
+
     while global_step < target_steps:
         model.eval()
         seed = py_rng.randrange(1 << 30)
@@ -581,17 +617,13 @@ def main():
         training_started = len(replay) >= args.replay_warmup
         now = time.time()
         if now - last_status_time >= 10.0:
-            try:
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                status_log.parent.mkdir(parents=True, exist_ok=True)
-                with status_log.open("a", encoding="ascii") as f:
-                    f.write(
-                        f"{ts} steps={global_step} replay={len(replay)} "
-                        f"training_started={training_started} last_ep_len={ep_len} "
-                        f"last_ep_reward={ep_reward:.3f} last_ep_max_len={ep_max_len}\n"
-                    )
-            except Exception:
-                pass
+            with status_lock:
+                status_state["steps"] = global_step
+                status_state["replay"] = len(replay)
+                status_state["training_started"] = training_started
+                status_state["last_ep_len"] = ep_len
+                status_state["last_ep_reward"] = ep_reward
+                status_state["last_ep_max_len"] = ep_max_len
             last_status_time = now
 
         if not log_ready and len(replay) >= args.replay_warmup:
