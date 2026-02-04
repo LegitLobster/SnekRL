@@ -467,6 +467,7 @@ def self_play_batch(
     batch_size: int,
     status_hook=None,
     status_interval: int = 10,
+    progress_hook=None,
 ):
     states = [SnekState.new(config, seed=seed + i * 9973) for i in range(batch_size)]
     episodes = [[] for _ in range(batch_size)]
@@ -523,6 +524,8 @@ def self_play_batch(
             last_reward = ep_rewards[active_idx[0]] if active_idx else 0.0
             last_max_len = max(ep_max_lens) if ep_max_lens else 0
             status_hook(total_steps, last_reward, last_max_len)
+            if progress_hook is not None:
+                progress_hook(total_steps, ep_rewards, ep_lengths, ep_max_lens, death_types)
             steps_since_status = 0
 
     examples_all = []
@@ -775,6 +778,64 @@ def main():
     threading.Thread(target=heartbeat_worker, daemon=True).start()
     _write_status(status_log, status_state)
 
+    def _mean_vals(vals):
+        if isinstance(vals, list):
+            return float(np.mean(vals)) if vals else 0.0
+        return float(np.mean(vals)) if vals is not None else 0.0
+
+    def _max_vals(vals):
+        if isinstance(vals, list):
+            return float(max(vals)) if vals else 0.0
+        return float(np.max(vals)) if vals is not None else 0.0
+
+    def log_progress(step_progress, ep_rewards, ep_lengths, ep_max_lens, death_types):
+        nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate
+        progress_steps = global_step + int(step_progress)
+        if progress_steps - last_log < args.log_interval:
+            return
+        now = time.time()
+        runtime_sec = now - start_time
+        dt = max(1e-6, now - (last_log_time or now))
+        dsteps = progress_steps - last_log_steps
+        fps = dsteps / dt if dsteps > 0 else 0.0
+
+        mean_reward = _mean_vals(ep_rewards)
+        mean_len = _mean_vals(ep_lengths)
+        mean_max_len = _mean_vals(ep_max_lens)
+        cur_best_len = int(max(stats.best_train_max_len, _max_vals(ep_max_lens)))
+
+        if cur_best_len > last_best_len:
+            dt_min = max(1e-6, (now - last_best_time) / 60.0)
+            best_train_rate = (cur_best_len - last_best_len) / dt_min
+            last_best_len = cur_best_len
+            last_best_time = now
+        if best_eval_max_len > 0:
+            best_eval_rate = best_eval_max_len / max(1e-6, runtime_sec / 60.0)
+
+        row = {
+            "steps": progress_steps,
+            "eps": 0.0,
+            "fps": fps,
+            "runtime_sec": runtime_sec,
+            "mean_reward": mean_reward,
+            "mean_len": mean_len,
+            "mean_max_len": mean_max_len,
+            "best_train_max_len": cur_best_len,
+            "best_eval_max_len": best_eval_max_len,
+            "best_train_rate_per_min": best_train_rate,
+            "best_eval_rate_per_min": best_eval_rate,
+            "loss": 0.0,
+            "buffer_size": len(replay),
+            "board_size": args.grid,
+            "death_wall_per_k": 0.0,
+            "death_self_per_k": 0.0,
+            "training_started": len(replay) >= args.replay_warmup,
+        }
+        write_row(train_log, row, train_header, error_log=error_log)
+        last_log = progress_steps
+        last_log_steps = progress_steps
+        last_log_time = now
+
     while global_step < target_steps:
         model.eval()
         seed = py_rng.randrange(1 << 30)
@@ -838,6 +899,7 @@ def main():
                 args.selfplay_batch,
                 status_hook=status_update,
                 status_interval=10,
+                progress_hook=log_progress,
             )
 
             if steps_taken <= 0:
