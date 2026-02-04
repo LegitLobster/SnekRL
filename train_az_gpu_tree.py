@@ -1295,9 +1295,9 @@ def main():
     global_step = start_step
     last_best_time = start_time
     last_best_len = 0
-    last_log_time = None
+    last_log_time = time.time()
     last_log_steps = start_step
-    log_ready = False
+    log_ready = True
     last_status_time = 0.0
     solved_streak = 0
     target_solve_len = args.solve_min_max_len if args.solve_min_max_len > 0 else args.grid * args.grid
@@ -1404,13 +1404,6 @@ def main():
                 status_state["last_ep_max_len"] = last_ep_max_len
             last_status_time = now
 
-        if not log_ready and len(replay) >= args.replay_warmup:
-            log_ready = True
-            last_log = global_step
-            last_eval = global_step
-            last_log_steps = global_step
-            last_log_time = time.time()
-
         loss_val = 0.0
         if training_started:
             model.train()
@@ -1441,7 +1434,7 @@ def main():
         else:
             loss_val = 0.0
 
-        if log_ready and training_started and (global_step - last_eval >= args.eval_interval):
+        if log_ready and (global_step - last_eval >= args.eval_interval):
             try:
                 eval_sims = args.eval_sims if args.eval_sims > 0 else args.mcts_sims
                 eval_max_len = 0
@@ -1499,7 +1492,7 @@ def main():
                 _log_error(error_log, f"save_checkpoint failed: {exc}")
             last_ckpt = global_step
 
-        if log_ready and training_started and (global_step - last_log >= args.log_interval):
+        if log_ready and (global_step - last_log >= args.log_interval):
             now = time.time()
             runtime_sec = now - start_time
             if last_log_time is None:
