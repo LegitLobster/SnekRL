@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from snek_env import SnekConfig
 
+AMP_ENABLED = False
+
 
 @dataclass
 class TrainStats:
@@ -25,6 +27,124 @@ class TrainStats:
     best_train_max_len: int = 0
     best_eval_max_len: int = 0
 
+
+@dataclass
+class MCTSWorkspace:
+    max_batch: int
+    max_nodes_per_root: int
+    max_depth: int
+    grid_w: int
+    grid_h: int
+    device: torch.device
+    child_index: torch.Tensor
+    child_prior: torch.Tensor
+    node_visit: torch.Tensor
+    node_value_sum: torch.Tensor
+    node_expanded: torch.Tensor
+    node_terminal: torch.Tensor
+    body_age: torch.Tensor
+    length: torch.Tensor
+    head_x: torch.Tensor
+    head_y: torch.Tensor
+    direction: torch.Tensor
+    food_x: torch.Tensor
+    food_y: torch.Tensor
+    steps_since_food: torch.Tensor
+    rng_state: torch.Tensor
+    root_offsets: torch.Tensor
+    wall_mask: torch.Tensor
+    dx: torch.Tensor
+    dy: torch.Tensor
+    opposite: torch.Tensor
+    legal_mask_table: torch.Tensor
+    path_nodes: torch.Tensor
+    cur_nodes: torch.Tensor
+    values: torch.Tensor
+    done_mask: torch.Tensor
+
+
+def make_mcts_workspace(
+    max_batch: int,
+    max_nodes_per_root: int,
+    max_depth: int,
+    config: SnekConfig,
+    device: torch.device,
+) -> MCTSWorkspace:
+    grid_w = int(config.grid_w)
+    grid_h = int(config.grid_h)
+    total_nodes = max_batch * max_nodes_per_root
+
+    child_index = torch.empty((total_nodes, 4), dtype=torch.int64, device=device)
+    child_prior = torch.empty((total_nodes, 4), dtype=torch.float32, device=device)
+    node_visit = torch.empty((total_nodes,), dtype=torch.float32, device=device)
+    node_value_sum = torch.empty((total_nodes,), dtype=torch.float32, device=device)
+    node_expanded = torch.empty((total_nodes,), dtype=torch.bool, device=device)
+    node_terminal = torch.empty((total_nodes,), dtype=torch.bool, device=device)
+
+    body_age = torch.empty((total_nodes, grid_h, grid_w), dtype=torch.int16, device=device)
+    length = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    head_x = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    head_y = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    direction = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    food_x = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    food_y = torch.empty((total_nodes,), dtype=torch.int16, device=device)
+    steps_since_food = torch.empty((total_nodes,), dtype=torch.int32, device=device)
+    rng_state = torch.empty((total_nodes,), dtype=torch.int64, device=device)
+
+    root_offsets = torch.arange(max_batch, device=device, dtype=torch.int64) * max_nodes_per_root
+
+    wall_mask = torch.zeros((grid_h, grid_w), dtype=torch.float32, device=device)
+    wall_mask[0, :] = 1.0
+    wall_mask[grid_h - 1, :] = 1.0
+    wall_mask[:, 0] = 1.0
+    wall_mask[:, grid_w - 1] = 1.0
+
+    dx = workspace.dx
+    dy = workspace.dy
+    opposite = workspace.opposite
+
+    legal_mask_table = torch.ones((4, 4), dtype=torch.bool, device=device)
+    reverse = torch.tensor([1, 0, 3, 2], dtype=torch.int64, device=device)
+    legal_mask_table[torch.arange(4, device=device), reverse] = False
+
+    path_nodes = torch.empty((max_batch, max_depth), dtype=torch.int64, device=device)
+    cur_nodes = torch.empty((max_batch,), dtype=torch.int64, device=device)
+    values = torch.empty((max_batch,), dtype=torch.float32, device=device)
+    done_mask = torch.empty((max_batch,), dtype=torch.bool, device=device)
+
+    return MCTSWorkspace(
+        max_batch=max_batch,
+        max_nodes_per_root=max_nodes_per_root,
+        max_depth=max_depth,
+        grid_w=grid_w,
+        grid_h=grid_h,
+        device=device,
+        child_index=child_index,
+        child_prior=child_prior,
+        node_visit=node_visit,
+        node_value_sum=node_value_sum,
+        node_expanded=node_expanded,
+        node_terminal=node_terminal,
+        body_age=body_age,
+        length=length,
+        head_x=head_x,
+        head_y=head_y,
+        direction=direction,
+        food_x=food_x,
+        food_y=food_y,
+        steps_since_food=steps_since_food,
+        rng_state=rng_state,
+        root_offsets=root_offsets,
+        wall_mask=wall_mask,
+        dx=dx,
+        dy=dy,
+        opposite=opposite,
+        legal_mask_table=legal_mask_table,
+        path_nodes=path_nodes,
+        cur_nodes=cur_nodes,
+        values=values,
+        done_mask=done_mask,
+    )
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int):
@@ -408,12 +528,12 @@ def step_state(state: dict, actions: torch.Tensor, config: SnekConfig, dx: torch
 
 
 def masked_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
-    neg_inf = torch.tensor(-1e9, device=logits.device)
-    mask = torch.where(legal_mask, torch.zeros_like(logits), neg_inf)
-    return F.softmax(logits + mask, dim=-1)
+    return F.softmax(logits.masked_fill(~legal_mask, -1e9), dim=-1)
 
 
-def legal_mask_from_dir(direction: torch.Tensor) -> torch.Tensor:
+def legal_mask_from_dir(direction: torch.Tensor, table: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if table is not None:
+        return table[direction.to(torch.int64)]
     b = direction.shape[0]
     mask = torch.ones((b, 4), dtype=torch.bool, device=direction.device)
     reverse = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=direction.device)
@@ -422,8 +542,9 @@ def legal_mask_from_dir(direction: torch.Tensor) -> torch.Tensor:
     return mask
 
 
+@torch.inference_mode()
 def policy_value_batch(model: nn.Module, obs_batch: torch.Tensor, legal_mask: torch.Tensor):
-    with torch.no_grad():
+    with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
         logits, values = model(obs_batch)
     probs = masked_softmax(logits, legal_mask)
     return probs, values.squeeze(1)
@@ -437,11 +558,12 @@ def select_puct(
     node_value_sum: torch.Tensor,
     direction: torch.Tensor,
     c_puct: float,
+    legal_mask_table: Optional[torch.Tensor] = None,
 ):
     idx = node_idx.to(torch.int64)
     child_idx = child_index[idx]
     priors = child_prior[idx]
-    legal_mask = legal_mask_from_dir(direction[idx])
+    legal_mask = legal_mask_from_dir(direction[idx], legal_mask_table)
 
     child_idx_clamped = torch.clamp(child_idx, min=0)
     child_visits = node_visit[child_idx_clamped]
@@ -469,51 +591,70 @@ def mcts_search_batch(
     device: torch.device,
     max_nodes_per_root: int,
     max_depth: int,
+    workspace: Optional[MCTSWorkspace] = None,
 ):
     batch = root_state["body_age"].shape[0]
-    grid_w = int(config.grid_w)
-    grid_h = int(config.grid_h)
+    if workspace is None or batch > workspace.max_batch or max_nodes_per_root > workspace.max_nodes_per_root or max_depth > workspace.max_depth:
+        workspace = make_mcts_workspace(max(batch, 1), max_nodes_per_root, max_depth, config, device)
+
+    grid_w = workspace.grid_w
+    grid_h = workspace.grid_h
     grid_cells = grid_w * grid_h
 
     total_nodes = batch * max_nodes_per_root
-    child_index = torch.full((total_nodes, 4), -1, dtype=torch.int64, device=device)
-    child_prior = torch.zeros((total_nodes, 4), dtype=torch.float32, device=device)
-    node_visit = torch.zeros((total_nodes,), dtype=torch.float32, device=device)
-    node_value_sum = torch.zeros((total_nodes,), dtype=torch.float32, device=device)
-    node_expanded = torch.zeros((total_nodes,), dtype=torch.bool, device=device)
-    node_terminal = torch.zeros((total_nodes,), dtype=torch.bool, device=device)
+    child_index = workspace.child_index[:total_nodes]
+    child_prior = workspace.child_prior[:total_nodes]
+    node_visit = workspace.node_visit[:total_nodes]
+    node_value_sum = workspace.node_value_sum[:total_nodes]
+    node_expanded = workspace.node_expanded[:total_nodes]
+    node_terminal = workspace.node_terminal[:total_nodes]
 
-    body_age = torch.full((total_nodes, grid_h, grid_w), -1, dtype=torch.int16, device=device)
-    length = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    head_x = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    head_y = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    direction = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    food_x = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    food_y = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
-    steps_since_food = torch.zeros((total_nodes,), dtype=torch.int32, device=device)
-    rng_state = torch.zeros((total_nodes,), dtype=torch.int64, device=device)
+    child_index.fill_(-1)
+    child_prior.zero_()
+    node_visit.zero_()
+    node_value_sum.zero_()
+    node_expanded.zero_()
+    node_terminal.zero_()
 
-    roots = torch.arange(batch, device=device, dtype=torch.int64) * max_nodes_per_root
-    for i in range(batch):
-        idx = roots[i]
-        body_age[idx] = root_state["body_age"][i]
-        length[idx] = root_state["length"][i]
-        head_x[idx] = root_state["head_x"][i]
-        head_y[idx] = root_state["head_y"][i]
-        direction[idx] = root_state["direction"][i]
-        food_x[idx] = root_state["food_x"][i]
-        food_y[idx] = root_state["food_y"][i]
-        steps_since_food[idx] = root_state["steps_since_food"][i]
-        rng_state[idx] = root_state["rng_state"][i]
+    body_age = workspace.body_age[:total_nodes]
+    length = workspace.length[:total_nodes]
+    head_x = workspace.head_x[:total_nodes]
+    head_y = workspace.head_y[:total_nodes]
+    direction = workspace.direction[:total_nodes]
+    food_x = workspace.food_x[:total_nodes]
+    food_y = workspace.food_y[:total_nodes]
+    steps_since_food = workspace.steps_since_food[:total_nodes]
+    rng_state = workspace.rng_state[:total_nodes]
 
-    wall_mask = torch.zeros((grid_h, grid_w), dtype=torch.float32, device=device)
-    wall_mask[0, :] = 1.0
-    wall_mask[grid_h - 1, :] = 1.0
-    wall_mask[:, 0] = 1.0
-    wall_mask[:, grid_w - 1] = 1.0
+    body_age.fill_(-1)
+    length.zero_()
+    head_x.zero_()
+    head_y.zero_()
+    direction.zero_()
+    food_x.zero_()
+    food_y.zero_()
+    steps_since_food.zero_()
+    rng_state.zero_()
+
+    if workspace.max_nodes_per_root == max_nodes_per_root:
+        roots = workspace.root_offsets[:batch]
+    else:
+        roots = torch.arange(batch, device=device, dtype=torch.int64) * max_nodes_per_root
+
+    body_age[roots] = root_state["body_age"]
+    length[roots] = root_state["length"]
+    head_x[roots] = root_state["head_x"]
+    head_y[roots] = root_state["head_y"]
+    direction[roots] = root_state["direction"]
+    food_x[roots] = root_state["food_x"]
+    food_y[roots] = root_state["food_y"]
+    steps_since_food[roots] = root_state["steps_since_food"]
+    rng_state[roots] = root_state["rng_state"]
+
+    wall_mask = workspace.wall_mask
 
     obs_root = build_obs(body_age[roots], food_x[roots], food_y[roots], wall_mask)
-    legal_mask = legal_mask_from_dir(direction[roots])
+    legal_mask = legal_mask_from_dir(direction[roots], workspace.legal_mask_table)
     root_priors, _root_values = policy_value_batch(model, obs_root, legal_mask)
     child_prior[roots] = root_priors
     node_expanded[roots] = True
@@ -528,10 +669,14 @@ def mcts_search_batch(
     next_free = roots + 1
 
     for _ in range(sims):
-        cur_nodes = roots.clone()
-        values = torch.zeros((batch,), dtype=torch.float32, device=device)
-        done_mask = torch.zeros((batch,), dtype=torch.bool, device=device)
-        path_nodes = torch.full((batch, max_depth), -1, dtype=torch.int64, device=device)
+        cur_nodes = workspace.cur_nodes[:batch]
+        cur_nodes.copy_(roots)
+        values = workspace.values[:batch]
+        values.zero_()
+        done_mask = workspace.done_mask[:batch]
+        done_mask.zero_()
+        path_nodes = workspace.path_nodes[:batch, :max_depth]
+        path_nodes.fill_(-1)
 
         for depth in range(max_depth):
             active = ~done_mask
@@ -550,7 +695,7 @@ def mcts_search_batch(
             if bool(eval_mask.any()):
                 eval_nodes = cur_nodes[eval_mask]
                 obs = build_obs(body_age[eval_nodes], food_x[eval_nodes], food_y[eval_nodes], wall_mask)
-                legal = legal_mask_from_dir(direction[eval_nodes])
+                legal = legal_mask_from_dir(direction[eval_nodes], workspace.legal_mask_table)
                 priors, vals = policy_value_batch(model, obs, legal)
                 child_prior[eval_nodes] = priors
                 node_expanded[eval_nodes] = True
@@ -563,7 +708,16 @@ def mcts_search_batch(
 
             active_idx = active.nonzero(as_tuple=False).squeeze(1)
             active_nodes = cur_nodes[active_idx]
-            actions = select_puct(active_nodes, child_index, child_prior, node_visit, node_value_sum, direction, c_puct)
+            actions = select_puct(
+                active_nodes,
+                child_index,
+                child_prior,
+                node_visit,
+                node_value_sum,
+                direction,
+                c_puct,
+                workspace.legal_mask_table,
+            )
             child = child_index[active_nodes, actions]
 
             need_new = child < 0
@@ -613,7 +767,7 @@ def mcts_search_batch(
                     child_index[valid_parent_nodes, valid_parent_actions] = valid_nodes
 
                     obs = build_obs(body_age[valid_nodes], food_x[valid_nodes], food_y[valid_nodes], wall_mask)
-                    legal = legal_mask_from_dir(direction[valid_nodes])
+                    legal = legal_mask_from_dir(direction[valid_nodes], workspace.legal_mask_table)
                     priors, vals = policy_value_batch(model, obs, legal)
                     child_prior[valid_nodes] = priors
                     node_expanded[valid_nodes] = True
@@ -637,7 +791,7 @@ def mcts_search_batch(
         if bool(leftover.any()):
             eval_nodes = cur_nodes[leftover]
             obs = build_obs(body_age[eval_nodes], food_x[eval_nodes], food_y[eval_nodes], wall_mask)
-            legal = legal_mask_from_dir(direction[eval_nodes])
+            legal = legal_mask_from_dir(direction[eval_nodes], workspace.legal_mask_table)
             _priors, vals = policy_value_batch(model, obs, legal)
             values[leftover] = vals
 
@@ -686,7 +840,6 @@ def self_play_batch_gpu(
     status_interval: int = 10,
 ):
     state = init_state(batch_size, config, device, seed)
-    episodes = [[] for _ in range(batch_size)]
     ep_rewards = torch.zeros((batch_size,), dtype=torch.float32, device=device)
     ep_lengths = torch.zeros((batch_size,), dtype=torch.int32, device=device)
     ep_max_lens = state["length"].to(torch.int32)
@@ -696,15 +849,16 @@ def self_play_batch_gpu(
     total_steps = 0
     steps_since_status = 0
 
-    wall_mask = torch.zeros((config.grid_h, config.grid_w), dtype=torch.float32, device=device)
-    wall_mask[0, :] = 1.0
-    wall_mask[config.grid_h - 1, :] = 1.0
-    wall_mask[:, 0] = 1.0
-    wall_mask[:, config.grid_w - 1] = 1.0
+    workspace = make_mcts_workspace(batch_size, max_nodes_per_root, max_depth, config, device)
+    wall_mask = workspace.wall_mask
+    dx = workspace.dx
+    dy = workspace.dy
+    opposite = workspace.opposite
 
-    dx = torch.tensor([0, 0, -1, 1], dtype=torch.int16, device=device)
-    dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
-    opposite = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=device)
+    obs_buf = torch.empty(
+        (batch_size, max_steps, 4, config.grid_h, config.grid_w), dtype=torch.float32, device=device
+    )
+    policy_buf = torch.empty((batch_size, max_steps, 4), dtype=torch.float32, device=device)
 
     while bool(active.any()):
         active_idx = active.nonzero(as_tuple=False).squeeze(1)
@@ -734,6 +888,7 @@ def self_play_batch_gpu(
             device,
             max_nodes_per_root,
             max_depth=max_depth,
+            workspace=workspace,
         )
 
         obs = build_obs(root_state["body_age"], root_state["food_x"], root_state["food_y"], wall_mask)
@@ -750,10 +905,9 @@ def self_play_batch_gpu(
             scaled[temp_mask] = scaled[temp_mask] / scaled_sum
             actions[temp_mask] = torch.multinomial(scaled[temp_mask], 1).squeeze(1)
 
-        obs_cpu = obs.detach().cpu().numpy()
-        policy_cpu = policy.detach().cpu().numpy()
-        for j, idx in enumerate(active_idx.tolist()):
-            episodes[idx].append((obs_cpu[j], policy_cpu[j]))
+        step_idx = ep_lengths[active_idx].to(torch.int64)
+        obs_buf[active_idx, step_idx] = obs
+        policy_buf[active_idx, step_idx] = policy
 
         actions_t = actions.to(torch.int16)
         next_state, rewards, done, info = step_state(root_state, actions_t, config, dx, dy, opposite)
@@ -787,12 +941,15 @@ def self_play_batch_gpu(
             steps_since_status = 0
 
     examples_all = []
-    for i, episode in enumerate(episodes):
-        if not episode:
+    for i in range(batch_size):
+        ep_len = int(ep_lengths[i].item())
+        if ep_len <= 0:
             continue
         outcome = outcome_value_tensor(state["length"][i].unsqueeze(0), config.grid_w * config.grid_h).item()
-        for obs, policy in episode:
-            examples_all.append((obs, policy, float(outcome)))
+        obs_cpu = obs_buf[i, :ep_len].detach().cpu().numpy()
+        policy_cpu = policy_buf[i, :ep_len].detach().cpu().numpy()
+        for j in range(ep_len):
+            examples_all.append((obs_cpu[j], policy_cpu[j], float(outcome)))
 
     return (
         examples_all,
@@ -821,9 +978,10 @@ def eval_episode_gpu(
     ep_reward = 0.0
     ep_max_len = int(state["length"][0].item())
 
-    dx = torch.tensor([0, 0, -1, 1], dtype=torch.int16, device=device)
-    dy = torch.tensor([-1, 1, 0, 0], dtype=torch.int16, device=device)
-    opposite = torch.tensor([1, 0, 3, 2], dtype=torch.int16, device=device)
+    workspace = make_mcts_workspace(1, max_nodes_per_root, max_depth, config, device)
+    dx = workspace.dx
+    dy = workspace.dy
+    opposite = workspace.opposite
 
     while not done and steps < max_steps:
         counts = mcts_search_batch(
@@ -837,6 +995,7 @@ def eval_episode_gpu(
             device=device,
             max_nodes_per_root=max_nodes_per_root,
             max_depth=max_depth,
+            workspace=workspace,
         )
         counts_cpu = counts.detach().cpu().numpy()[0]
         action = int(counts_cpu.argmax()) if counts_cpu.sum() > 0 else 0
@@ -883,6 +1042,7 @@ def main():
     parser.add_argument("--solve-min-max-len", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=2_000)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--clean-logs", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-interval", type=int, default=50_000)
@@ -895,6 +1055,18 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+
+    global AMP_ENABLED
+    AMP_ENABLED = bool(args.amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
     np_rng = np.random.default_rng(args.seed if args.seed > 0 else None)
     py_rng = random.Random(args.seed if args.seed > 0 else None)
 
@@ -1136,15 +1308,21 @@ def main():
                 policy_t = torch.from_numpy(b_policy).to(device)
                 value_t = torch.from_numpy(b_value).to(device)
 
-                logits, value_pred = model(obs_t)
-                log_probs = F.log_softmax(logits, dim=1)
-                policy_loss = -(policy_t * log_probs).sum(dim=1).mean()
-                value_loss = F.mse_loss(value_pred.squeeze(1), value_t)
-                loss = policy_loss + args.value_loss_weight * value_loss
-
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+                    logits, value_pred = model(obs_t)
+                    log_probs = F.log_softmax(logits, dim=1)
+                    policy_loss = -(policy_t * log_probs).sum(dim=1).mean()
+                    value_loss = F.mse_loss(value_pred.squeeze(1), value_t)
+                    loss = policy_loss + args.value_loss_weight * value_loss
+
+                if AMP_ENABLED:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
                 loss_val = float(loss.item())
         else:
             loss_val = 0.0

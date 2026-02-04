@@ -46,6 +46,7 @@
                 "0",
                 "--plot-refresh-ms",
                 "1000",
+                "--amp",
                 "--device",
                 "cuda",
                 "--plot-no-stream"
@@ -97,6 +98,7 @@
                 "0",
                 "--plot-refresh-ms",
                 "1000",
+                "--amp",
                 "--device",
                 "cuda",
                 "--plot-no-stream"
