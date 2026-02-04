@@ -204,9 +204,10 @@ def build_obs(body_age: torch.Tensor, food_x: torch.Tensor, food_y: torch.Tensor
 
 
 def _lcg_next(state: torch.Tensor) -> torch.Tensor:
-    return state * torch.tensor(6364136223846793005, dtype=torch.uint64, device=state.device) + torch.tensor(
-        1442695040888963407, dtype=torch.uint64, device=state.device
-    )
+    a = torch.tensor(6364136223846793005, dtype=torch.int64, device=state.device)
+    c = torch.tensor(1442695040888963407, dtype=torch.int64, device=state.device)
+    mask = torch.tensor((1 << 63) - 1, dtype=torch.int64, device=state.device)
+    return torch.bitwise_and(state * a + c, mask)
 
 
 def resample_food(
@@ -235,17 +236,18 @@ def resample_food(
     new_y = food_y
     need = mask
     grid_cells = grid_w * grid_h
+    grid_cells_t = torch.tensor(grid_cells, dtype=torch.int64, device=device)
 
     for _ in range(attempts):
         rng = _lcg_next(rng)
-        idx = ((rng >> 33) % torch.tensor(grid_cells, dtype=torch.uint64, device=device)).to(torch.int64)
+        idx = (rng >> 33) % grid_cells_t
         free = ~occupancy.gather(1, idx.unsqueeze(1)).squeeze(1)
         accept = need & free
         new_x = torch.where(accept, (idx % grid_w).to(new_x.dtype), new_x)
         new_y = torch.where(accept, (idx // grid_w).to(new_y.dtype), new_y)
         need = need & ~accept
 
-    arange = torch.arange(grid_cells, device=device).view(1, -1)
+    arange = torch.arange(grid_cells, device=device, dtype=torch.int64).view(1, -1)
     scores = torch.where(occupancy, torch.full_like(arange, grid_cells + 1), arange)
     first_idx = scores.argmin(dim=1)
     new_x = torch.where(need, (first_idx % grid_w).to(new_x.dtype), new_x)
@@ -279,8 +281,8 @@ def init_state(batch: int, config: SnekConfig, device: torch.device, seed: int):
 
     base_seed = seed if seed > 0 else 12345
     rng_state = (
-        torch.arange(batch, dtype=torch.uint64, device=device) * torch.tensor(9973, dtype=torch.uint64, device=device)
-        + torch.tensor(base_seed, dtype=torch.uint64, device=device)
+        torch.arange(batch, dtype=torch.int64, device=device) * torch.tensor(9973, dtype=torch.int64, device=device)
+        + torch.tensor(base_seed, dtype=torch.int64, device=device)
     )
 
     food_x, food_y, rng_state = resample_food(
@@ -488,7 +490,7 @@ def mcts_search_batch(
     food_x = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
     food_y = torch.zeros((total_nodes,), dtype=torch.int16, device=device)
     steps_since_food = torch.zeros((total_nodes,), dtype=torch.int32, device=device)
-    rng_state = torch.zeros((total_nodes,), dtype=torch.uint64, device=device)
+    rng_state = torch.zeros((total_nodes,), dtype=torch.int64, device=device)
 
     roots = torch.arange(batch, device=device, dtype=torch.int64) * max_nodes_per_root
     for i in range(batch):
