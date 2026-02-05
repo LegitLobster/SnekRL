@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import time
 
 
 def _win_to_wsl(path: str) -> str:
@@ -48,7 +49,7 @@ def main() -> int:
     cmd = (
         f"source {venv_wsl}/bin/activate && "
         f"cd {repo_wsl} && "
-        "python train_az_gpu_tree.py "
+        "python -u train_az_gpu_tree.py "
         "--clean-logs "
         "--timesteps 0 "
         "--grid 12 "
@@ -75,23 +76,29 @@ def main() -> int:
         "--solve-evals 3 "
         "--solve-min-max-len 0 "
         "--torch-compile "
+        "--compile-mode reduce-overhead "
         "--amp "
         "--device cuda "
         "--plot-no-stream"
     )
 
     args = ["wsl.exe", "-d", distro, "--", "bash", "-lc", cmd]
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode != 0:
-        msg = f"WSL command failed with exit code {result.returncode}."
-        if result.stdout:
-            msg += "\nstdout:\n" + result.stdout
-        if result.stderr:
-            msg += "\nstderr:\n" + result.stderr
-        print(msg)
+    log_path = os.path.join(repo_win, "rl_out_az_gpu", "error.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="ascii") as log_file:
+            log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO: WSL run started\n")
+            log_file.flush()
+            result = subprocess.run(args, stdout=log_file, stderr=log_file, text=True)
+            if result.returncode != 0:
+                log_file.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR: WSL command failed with exit code {result.returncode}\n"
+                )
+                log_file.flush()
+    except Exception as exc:
         try:
-            with open(os.path.join(repo_win, "rl_out_az_gpu", "error.log"), "a", encoding="ascii") as f:
-                f.write(msg + "\n")
+            with open(log_path, "a", encoding="ascii") as log_file:
+                log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR: WSL runner failed: {exc}\n")
         except Exception:
             pass
     return 0

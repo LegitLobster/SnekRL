@@ -229,6 +229,19 @@ def ensure_csv(path: Path, header: List[str], clean: bool):
             writer.writerow(header)
 
 
+def csv_has_data(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="ascii") as f:
+            for idx, line in enumerate(f):
+                if idx == 0:
+                    continue
+                if line.strip():
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def _log_error(path: Path, message: str):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1286,6 +1299,32 @@ def main():
                 except Exception:
                     pass
                 _log_error(error_log, "Failed to load checkpoint; renamed to .bad and starting fresh.")
+
+    if start_step == 0 and not csv_has_data(train_log):
+        write_row(
+            train_log,
+            {
+                "steps": 0,
+                "eps": 0.0,
+                "fps": 0.0,
+                "runtime_sec": 0.0,
+                "mean_reward": 0.0,
+                "mean_len": 0.0,
+                "mean_max_len": 0.0,
+                "best_train_max_len": 0,
+                "best_eval_max_len": best_eval_max_len,
+                "best_train_rate_per_min": 0.0,
+                "best_eval_rate_per_min": 0.0,
+                "loss": 0.0,
+                "buffer_size": 0,
+                "board_size": args.grid,
+                "death_wall_per_k": 0.0,
+                "death_self_per_k": 0.0,
+                "training_started": False,
+            },
+            train_header,
+            error_log=error_log,
+        )
 
     if args.timesteps <= 0:
         target_steps = math.inf
