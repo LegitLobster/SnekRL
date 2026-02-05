@@ -800,7 +800,7 @@ def main():
     def log_progress(step_progress, ep_rewards, ep_lengths, ep_max_lens, death_types):
         nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate, first_progress_log
         progress_steps = global_step + int(step_progress)
-        if not first_progress_log and (progress_steps - last_log < args.log_interval):
+        if progress_steps <= last_log and not first_progress_log:
             return
         now = time.time()
         runtime_sec = now - start_time
