@@ -563,11 +563,11 @@ def legal_mask_from_dir(direction: torch.Tensor, table: Optional[torch.Tensor] =
     return mask
 
 
-@torch.inference_mode()
 def policy_value_batch(model: nn.Module, obs_batch: torch.Tensor, legal_mask: torch.Tensor):
-    with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
-        logits, values = model(obs_batch)
-    probs = masked_softmax(logits, legal_mask)
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
+            logits, values = model(obs_batch)
+        probs = masked_softmax(logits, legal_mask)
     return probs, values.squeeze(1).float()
 
 
@@ -1224,6 +1224,12 @@ def main():
                     import torch._dynamo as dynamo
 
                     dynamo.config.suppress_errors = True
+                except Exception:
+                    pass
+                try:
+                    import torch._inductor.config as inductor_config
+
+                    inductor_config.triton.cudagraphs = False
                 except Exception:
                     pass
                 model = torch.compile(model, mode=args.compile_mode)
