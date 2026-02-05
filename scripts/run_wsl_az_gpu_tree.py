@@ -21,6 +21,23 @@ def main() -> int:
     repo_wsl = _win_to_wsl(repo_win)
     venv_wsl = f"{repo_wsl}/.venv_wsl"
 
+    # Launch the Windows plotter against the shared CSV logs.
+    try:
+        plot_cmd = [
+            sys.executable,
+            os.path.join(repo_win, "plot_live.py"),
+            "--log",
+            os.path.join(repo_win, "rl_out_az_gpu", "train_log.csv"),
+            "--eval",
+            os.path.join(repo_win, "rl_out_az_gpu", "eval_log.csv"),
+            "--refresh-ms",
+            "1000",
+            "--no-stream",
+        ]
+        subprocess.Popen(plot_cmd, cwd=repo_win)
+    except Exception:
+        pass
+
     cmd = (
         f"source {venv_wsl}/bin/activate && "
         f"cd {repo_wsl} && "
