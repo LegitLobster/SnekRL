@@ -532,7 +532,11 @@ def step_state(state: dict, actions: torch.Tensor, config: SnekConfig, dx: torch
 
 
 def masked_softmax(logits: torch.Tensor, legal_mask: torch.Tensor) -> torch.Tensor:
-    return F.softmax(logits.masked_fill(~legal_mask, -1e9), dim=-1)
+    # Avoid fp16 overflow from large negative mask values by computing in fp32.
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        logits = logits.float()
+    masked = logits.masked_fill(~legal_mask, -1e9)
+    return F.softmax(masked, dim=-1)
 
 
 def legal_mask_from_dir(direction: torch.Tensor, table: Optional[torch.Tensor] = None) -> torch.Tensor:
