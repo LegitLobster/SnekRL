@@ -1427,9 +1427,10 @@ def main():
         return float(max(vals)) if vals else 0.0
 
     first_progress_log = True
+    last_progress_row = None
 
     def log_progress(step_progress, ep_rewards, ep_lengths, ep_max_lens, death_types):
-        nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate, first_progress_log
+        nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate, first_progress_log, last_progress_row
         progress_steps = global_step + int(step_progress)
         if progress_steps <= last_log and not first_progress_log:
             return
@@ -1472,6 +1473,7 @@ def main():
             "training_started": len(replay) >= args.replay_warmup,
         }
         write_row(train_log, row, train_header, error_log=error_log)
+        last_progress_row = dict(row)
         last_log = progress_steps
         last_log_steps = progress_steps
         last_log_time = now
@@ -1514,6 +1516,18 @@ def main():
         replay.add_many(examples_all)
         global_step += steps_taken
         death_steps_window += steps_taken
+
+        # Update status with replay fill progress and emit a row reflecting buffer/training state.
+        with status_lock:
+            status_state["steps"] = global_step
+            status_state["replay"] = len(replay)
+            status_state["training_started"] = len(replay) >= args.replay_warmup
+        if last_progress_row is not None:
+            row = dict(last_progress_row)
+            row["steps"] = global_step
+            row["buffer_size"] = len(replay)
+            row["training_started"] = len(replay) >= args.replay_warmup
+            write_row(train_log, row, train_header, error_log=error_log)
 
         for ep_reward, ep_len, ep_max_len, death_type in zip(ep_rewards, ep_lengths, ep_max_lens, death_types):
             if ep_len <= 0:
