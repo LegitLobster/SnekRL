@@ -243,6 +243,8 @@ def policy_value_batch_torch(
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             logits, values = model(obs_t)
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        logits = logits.float()
     mask = torch.full_like(logits, -1e9)
     for i, legal in enumerate(legal_actions_list):
         mask[i, legal] = 0.0
