@@ -774,6 +774,15 @@
             "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Snek RL: AlphaZero MP (WSL CPU+GPU) + Live Plot",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\scripts\\run_wsl_az_mp.py",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
         }
     ]
 }
