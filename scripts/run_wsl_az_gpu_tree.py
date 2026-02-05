@@ -83,9 +83,13 @@ def main() -> int:
     )
 
     args = ["wsl.exe", "-d", distro, "--", "bash", "-lc", cmd]
-    result = subprocess.run(args)
+    result = subprocess.run(args, capture_output=True, text=True)
     if result.returncode != 0:
         msg = f"WSL command failed with exit code {result.returncode}."
+        if result.stdout:
+            msg += "\nstdout:\n" + result.stdout
+        if result.stderr:
+            msg += "\nstderr:\n" + result.stderr
         print(msg)
         try:
             with open(os.path.join(repo_win, "rl_out_az_gpu", "error.log"), "a", encoding="ascii") as f:
