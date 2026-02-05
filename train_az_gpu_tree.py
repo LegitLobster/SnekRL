@@ -1365,10 +1365,12 @@ def main():
             return float(vals.max().item())
         return float(max(vals)) if vals else 0.0
 
+    first_progress_log = True
+
     def log_progress(step_progress, ep_rewards, ep_lengths, ep_max_lens, death_types):
-        nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate
+        nonlocal last_log, last_log_time, last_log_steps, best_train_rate, last_best_len, last_best_time, best_eval_rate, first_progress_log
         progress_steps = global_step + int(step_progress)
-        if progress_steps - last_log < args.log_interval:
+        if not first_progress_log and (progress_steps - last_log < args.log_interval):
             return
         now = time.time()
         runtime_sec = now - start_time
@@ -1412,6 +1414,7 @@ def main():
         last_log = progress_steps
         last_log_steps = progress_steps
         last_log_time = now
+        first_progress_log = False
     while global_step < target_steps:
         model.eval()
         seed = py_rng.randrange(1 << 30)
