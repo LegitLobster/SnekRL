@@ -1164,6 +1164,8 @@ def main():
     parser.add_argument("--log-interval", type=int, default=2_000)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--torch-compile", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default="max-autotune", choices=["default", "reduce-overhead", "max-autotune"])
     parser.add_argument("--clean-logs", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--checkpoint-interval", type=int, default=50_000)
@@ -1194,6 +1196,11 @@ def main():
     config = SnekConfig(grid_w=args.grid, grid_h=args.grid)
 
     model = build_model(args.model_size, 4, args.grid, args.grid, 4).to(device)
+    if args.torch_compile and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+        except Exception:
+            pass
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     replay = ReplayBuffer(args.replay_size)
