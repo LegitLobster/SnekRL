@@ -747,7 +747,7 @@ def mcts_search_batch(
             )
             child = child_index[active_nodes, actions]
 
-            need_new = child < 0
+            need_new = (child < 0) | (child >= total_nodes)
             if bool(need_new.any()):
                 new_idx = active_idx[need_new]
                 parent_nodes = active_nodes[need_new]
@@ -832,8 +832,9 @@ def mcts_search_batch(
 
     counts = torch.zeros((batch, 4), dtype=torch.float32, device=device)
     root_children = child_index[roots]
-    child_visits = node_visit[torch.clamp(root_children, min=0, max=total_nodes - 1)]
-    counts = torch.where(root_children >= 0, child_visits, counts)
+    valid_child = (root_children >= 0) & (root_children < total_nodes)
+    if bool(valid_child.any().item()):
+        counts[valid_child] = node_visit[root_children[valid_child]]
     return counts
 
 def select_action_from_policy(policy: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
