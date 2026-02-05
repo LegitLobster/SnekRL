@@ -1198,9 +1198,20 @@ def main():
     model = build_model(args.model_size, 4, args.grid, args.grid, 4).to(device)
     if args.torch_compile and hasattr(torch, "compile"):
         try:
-            model = torch.compile(model, mode=args.compile_mode)
-        except Exception:
-            pass
+            import importlib.util
+
+            if importlib.util.find_spec("triton") is None:
+                _log_error(Path(args.out_dir) / "error.log", "torch_compile disabled: triton not installed")
+            else:
+                try:
+                    import torch._dynamo as dynamo
+
+                    dynamo.config.suppress_errors = True
+                except Exception:
+                    pass
+                model = torch.compile(model, mode=args.compile_mode)
+        except Exception as exc:
+            _log_error(Path(args.out_dir) / "error.log", f"torch_compile failed: {exc}")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     replay = ReplayBuffer(args.replay_size)
