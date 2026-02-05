@@ -568,7 +568,7 @@ def policy_value_batch(model: nn.Module, obs_batch: torch.Tensor, legal_mask: to
     with torch.cuda.amp.autocast(enabled=AMP_ENABLED):
         logits, values = model(obs_batch)
     probs = masked_softmax(logits, legal_mask)
-    return probs, values.squeeze(1)
+    return probs, values.squeeze(1).float()
 
 
 def select_puct(
