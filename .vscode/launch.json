@@ -765,6 +765,15 @@
                 "--plot-no-stream"
             ],
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Snek RL: AlphaZero GPU Tree (WSL Triton) + Live Plot",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}\\scripts\\run_wsl_az_gpu_tree.py",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
         }
     ]
 }
